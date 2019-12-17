@@ -34,6 +34,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifndef ROTR32
 #define ROTR32(v,n)(((v)>>(n))|((v)<<(32-(n))))

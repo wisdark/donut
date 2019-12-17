@@ -8,21 +8,18 @@
 #ifndef __WIN_TYPES
 #define __WIN_TYPES__
 
-/*
-#if _MSC_VER
-    #ifndef snprintf
-        #define snprintf _snprintf
-    #endif
-    #ifndef snscanf
-        #define snscanf _snscanf
-    #endif
-#endif
-*/
-
 #ifdef _MSC_VER
     #include <stdint.h>
 #else
     #include <inttypes.h>
+#endif
+
+#ifndef FALSE
+#define FALSE 0
+#endif
+
+#ifndef TRUE
+#define TRUE 1
 #endif
 
 #ifndef BYTE
@@ -68,11 +65,6 @@ typedef unsigned char BYTE;
 // wchar_t is 32-bits on Linux
 #ifndef WCHAR
     typedef uint16_t WCHAR;
-#endif
-
-// this might be a problem..
-#ifndef ULONG_PTR
-    typedef ULONGULONG *ULONG_PTR;
 #endif
 
 #ifndef VOID
