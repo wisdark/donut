@@ -34,6 +34,9 @@
 
 #include <windows.h>
 
+    typedef LPSTR (WINAPI *GetCommandLineA_t)(VOID);
+    typedef LPWSTR (WINAPI *GetCommandLineW_t)(VOID);
+    
     typedef void (WINAPI *Sleep_t)(DWORD dwMilliseconds);
 
     typedef int (WINAPI *MultiByteToWideChar_t)(
@@ -496,6 +499,20 @@
       LPCONTEXT              lpContext);
 
     typedef HANDLE (WINAPI *GetCurrentThread_t)(VOID);
+    
+    typedef PVOID (WINAPI *AddVectoredExceptionHandler_t)(
+      ULONG                       First,
+      PVECTORED_EXCEPTION_HANDLER Handler);
+
+    typedef ULONG (WINAPI *RemoveVectoredExceptionHandler_t)(
+      PVOID                       Handle);
+
+    typedef PVOID (WINAPI *AddVectoredContinueHandler_t)(
+      ULONG                       First,
+      PVECTORED_EXCEPTION_HANDLER Handler);
+
+    typedef ULONG (WINAPI *RemoveVectoredContinueHandler_t)(PVOID Handle);
+
  #endif
  
  

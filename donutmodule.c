@@ -34,7 +34,6 @@
 #include <Python.h>
 #include "donut.h"
 
-
 static PyObject *Donut_Create(PyObject *self, PyObject *args, PyObject *keywds) {
     char *input = NULL;       // input file to execute in-memory
     
@@ -61,16 +60,16 @@ static PyObject *Donut_Create(PyObject *self, PyObject *args, PyObject *keywds) 
     char *modname = NULL;     // name of module stored on HTTP server
     
     static char *kwlist[] = {
-      "input", "arch", "bypass", "compress", "entropy", 
+      "file", "arch", "bypass", "compress", "entropy", 
       "format", "exit_opt", "thread", "oep", "output", 
-      "runtime", "domain", "cls", "method", "params", 
-      "unicode", "server", "modname", NULL};
+      "runtime", "appdomain", "cls", "method", "params", 
+      "unicode", "server", "url", "modname", NULL};
       
     if (!PyArg_ParseTupleAndKeywords(
-      args, keywds, "s|iiiiiiisssssssiss", kwlist, &input, &arch, 
+      args, keywds, "s|iiiiiiisssssssisss", kwlist, &input, &arch, 
       &bypass, &compress, &entropy, &format, &exit_opt, &thread, 
       &oep, &output, &runtime, &domain, &cls, &method, &params, 
-      &unicode, &server, &modname)) 
+      &unicode, &server, &server, &modname)) 
     {
         return NULL;
     }
@@ -90,6 +89,11 @@ static PyObject *Donut_Create(PyObject *self, PyObject *args, PyObject *keywds) 
     c.exit_opt  = DONUT_OPT_EXIT_THREAD;  // default behaviour is to exit the thread
     c.unicode   = 0;                      // command line will not be converted to unicode for unmanaged DLL function
 
+    // input file
+    if(input != NULL) {
+      strncpy(c.input, input, DONUT_MAX_NAME - 1);
+    }
+    
     // target cpu architecture
     if(arch != 0) {
       c.arch = arch;
@@ -160,7 +164,9 @@ static PyObject *Donut_Create(PyObject *self, PyObject *args, PyObject *keywds) 
       c.compress = compress;
     }
 
-    DonutCreate(&c);
+    int err = DonutCreate(&c);
+
+    // printf("Error : %i\n", err); 
     
     PyObject *shellcode = Py_BuildValue("y#", c.pic, c.pic_len);
 
@@ -176,9 +182,9 @@ static PyMethodDef Donut_FunctionsTable[] = {
         Donut_Create, // C wrapper function
         METH_VARARGS|METH_KEYWORDS,
         "Calls DonutCreate to generate shellcode for a .NET assembly" // documentation
-    }, {
-        NULL, NULL, 0, NULL
-    }
+    }, 
+    
+    {NULL, NULL, 0, NULL}
 };
 
 // modules definition

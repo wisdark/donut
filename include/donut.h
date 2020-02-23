@@ -32,6 +32,11 @@
 #ifndef DONUT_H
 #define DONUT_H
 
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_NONSTDC_NO_DEPRECATE
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +55,7 @@
 #if defined(_MSC_VER)
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
+#define strcasecmp stricmp
 #endif
 #else
 #define LINUX
@@ -120,6 +126,7 @@ typedef struct _GUID {
 #define DONUT_ERROR_INVALID_ENGINE      18
 #define DONUT_ERROR_COMPRESSION         19
 #define DONUT_ERROR_INVALID_ENTROPY     20
+#define DONUT_ERROR_MIXED_ASSEMBLY      21
 
 // target architecture
 #define DONUT_ARCH_ANY                  -1  // for vbs and js files
@@ -278,6 +285,8 @@ typedef struct _DONUT_INSTANCE {
         CreateThread_t                   CreateThread;
         GetThreadContext_t               GetThreadContext;
         GetCurrentThread_t               GetCurrentThread;
+        GetCommandLineA_t                GetCommandLineA;
+        GetCommandLineW_t                GetCommandLineW;
         
         // imports from shell32.dll
         CommandLineToArgvW_t             CommandLineToArgvW;
@@ -322,8 +331,10 @@ typedef struct _DONUT_INSTANCE {
         RtlExitUserProcess_t             RtlExitUserProcess;
         RtlCreateUnicodeString_t         RtlCreateUnicodeString;
         RtlGetCompressionWorkSpaceSize_t RtlGetCompressionWorkSpaceSize;
-        RtlDecompressBufferEx_t          RtlDecompressBufferEx;
+        RtlDecompressBuffer_t            RtlDecompressBuffer;
         NtContinue_t                     NtContinue;
+        AddVectoredExceptionHandler_t    AddVectoredExceptionHandler;
+        RemoveVectoredExceptionHandler_t RemoveVectoredExceptionHandler;
        // RtlFreeUnicodeString_t         RtlFreeUnicodeString;
        // RtlFreeString_t                RtlFreeString;
       };
@@ -377,7 +388,7 @@ typedef struct _DONUT_INSTANCE {
     GUID        xIID_IActiveScriptParse32;     // parser
     GUID        xIID_IActiveScriptParse64;
     
-    int         type;                       // DONUT_INSTANCE_EMBED, DONUT_INSTANCE_HTTP or DONUT_INSTANCE_DNS 
+    int         type;                       // DONUT_INSTANCE_EMBED, DONUT_INSTANCE_HTTP 
     char        server[DONUT_MAX_NAME];     // staging server hosting donut module
     char        http_req[8];                // just a buffer for "GET"
 
@@ -450,7 +461,6 @@ extern "C" {
 
 // public functions
 EXPORT_FUNC int DonutCreate(PDONUT_CONFIG);
-EXPORT_FUNC int DonutCreateWrapper(const char *);
 EXPORT_FUNC int DonutDelete(PDONUT_CONFIG);
 EXPORT_FUNC const char* DonutError(int);
 

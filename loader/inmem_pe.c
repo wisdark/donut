@@ -42,8 +42,8 @@ typedef struct _IMAGE_RELOC {
 
 typedef BOOL  (WINAPI *DllMain_t)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
 typedef VOID  (WINAPI *Start_t)(PPEB);
-typedef void  (WINAPI *DllParam_t)(PVOID);
-typedef void  (WINAPI *DllVoid_t)(VOID);
+typedef VOID  (WINAPI *DllParam_t)(PVOID);
+typedef VOID  (WINAPI *DllVoid_t)(VOID);
 
 // for setting the command line...
 typedef CHAR**  (WINAPI *p_acmdln_t)(VOID);
@@ -126,8 +126,8 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     if(rva != 0) {
       DPRINT("Applying Relocations");
       
-      ibr  = RVA2VA(PIMAGE_BASE_RELOCATION, cs, rva);
-      ofs  = (PBYTE)cs - nt->OptionalHeader.ImageBase;
+      ibr = RVA2VA(PIMAGE_BASE_RELOCATION, cs, rva);
+      ofs = (PBYTE)cs - nt->OptionalHeader.ImageBase;
       
       while(ibr->VirtualAddress != 0) {
         list = (PIMAGE_RELOC)(ibr + 1);
@@ -259,7 +259,7 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     if(mod->type == DONUT_MODULE_DLL) {
       DPRINT("Executing entrypoint of DLL\n\n");
       DllMain = RVA2VA(DllMain_t, cs, nt->OptionalHeader.AddressOfEntryPoint);
-      DllMain(host, DLL_PROCESS_ATTACH, NULL);
+      DllMain(cs, DLL_PROCESS_ATTACH, NULL);
       
       // call exported api?
       if(mod->method[0] != 0) {
@@ -298,7 +298,7 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
                 if(mod->unicode) {
                   ansi2unicode(inst, mod->param, buf);
                 }
-                DllParam((mod->unicode == 1) ? (PVOID)buf : (PVOID)mod->param);
+                DllParam((mod->unicode) ? (PVOID)buf : (PVOID)mod->param);
               } else {
                 // execute DLL function with no parameters
                 DllVoid = (DllVoid_t)DllParam;
@@ -346,9 +346,6 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
 pe_cleanup:
     // if memory allocated
     if(cs != NULL) {
-      DPRINT("Erasing %" PRIi32 " bytes of memory at %p", size_of_img, cs);
-      // erase in-memory copy
-      Memset(cs, 0, size_of_img);
       // release
       DPRINT("Releasing memory");
       inst->api.VirtualFree(cs, 0, MEM_DECOMMIT | MEM_RELEASE);
@@ -425,7 +422,7 @@ BOOL SetCommandLineW(PDONUT_INSTANCE inst, PCWSTR CommandLine) {
     CHAR                         sym[128];
     PCHAR                        str;
     INT                          fptr, atype;
-    PVOID                        addr;
+    PVOID                        addr, wcmd, acmd;
     
     peb = (PPEB)NtCurrentTeb()->ProcessEnvironmentBlock;
     upp = peb->ProcessParameters;
@@ -448,39 +445,29 @@ BOOL SetCommandLineW(PDONUT_INSTANCE inst, PCWSTR CommandLine) {
     
     DPRINT("Searching %i pointers", cnt);
     
-    // for each pointer
+    wcmd = inst->api.GetCommandLineW();
+    
     for(i=0; i<cnt; i++) {
       wcs = (PUNICODE_STRING)&ds[i];
-      // skip if buffer doesn't point to heap memory
-      if(!IsHeapPtr(inst, wcs->Buffer)) continue;
       // skip if not equal
-      if(!inst->api.RtlEqualUnicodeString(&upp->CommandLine, wcs, TRUE)) continue;
-      DPRINT("BaseUnicodeCommandLine at %p : %ws", &ds[i], wcs->Buffer);
-      // convert command line to ansi
-      inst->api.RtlUnicodeStringToAnsiString(&ansi, &upp->CommandLine, TRUE);
-      // overwrite the existing command line for GetCommandLineW
+      if(wcs->Buffer != wcmd) continue;
+      DPRINT("BaseUnicodeCommandLine found at %p:%p : %ws", &ds[i], wcs->Buffer, wcs->Buffer);
+      // overwrite buffer for GetCommandLineW
       inst->api.RtlCreateUnicodeString(wcs, CommandLine);
-      // and the one in PEB (disabled for now as it's not required)
-      //inst->api.RtlCreateUnicodeString(&upp->CommandLine, CommandLine);
-      
-      DPRINT("New BaseUnicodeCommandLine at %p : %ws", &ds[i], GetCommandLineW());
-      bSet = TRUE;
+      DPRINT("GetCommandLineW() : %ws", GetCommandLineW());
       break;
     }
     
-    if(!bSet) return FALSE;
+    acmd = inst->api.GetCommandLineA();
     
-    // for each pointer
     for(i=0; i<cnt; i++) {
       mbs = (PANSI_STRING)&ds[i];
-      // skip if buffer doesn't point to heap memory
-      if(!IsHeapPtr(inst, mbs->Buffer)) continue;
       // skip if not equal
-      if(!inst->api.RtlEqualString(&ansi, mbs, TRUE)) continue;
-      // overwrite existing command line for GetCommandLineA
+      if(mbs->Buffer != acmd) continue;
+      DPRINT("BaseAnsiCommandLine found at %p:%p : %ws", &ds[i], mbs->Buffer, mbs->Buffer);
       inst->api.RtlUnicodeStringToAnsiString(&ansi, wcs, TRUE);
       Memcpy(&ds[i], &ansi, sizeof(ANSI_STRING));
-      DPRINT("New BaseAnsiCommandLine at %p : %s", &ds[i], GetCommandLineA());
+      DPRINT("GetCommandLineA() : %s", GetCommandLineA());
       break;
     }
     
@@ -525,7 +512,8 @@ BOOL SetCommandLineW(PDONUT_INSTANCE inst, PCWSTR CommandLine) {
             argv = p_acmdln();
           }
           // anything to patch?
-          if(argv != NULL && *argv != NULL) {
+          DPRINT("Checking %s", sym);
+          if(argv != NULL && IsHeapPtr(inst, *argv)) {
             DPRINT("Setting %ws!%s \"%s\" to \"%s\"", 
               dte->BaseDllName.Buffer, sym, *argv, ansi.Buffer);
             *argv = ansi.Buffer;
@@ -538,7 +526,8 @@ BOOL SetCommandLineW(PDONUT_INSTANCE inst, PCWSTR CommandLine) {
             wargv = p_wcmdln();
           }
           // anything to patch?
-          if(wargv != NULL && *wargv != NULL) {
+          DPRINT("Checking %s", sym);
+          if(wargv != NULL && IsHeapPtr(inst, *wargv)) {
             DPRINT("Setting %ws!%s \"%ws\" to \"%ws\"", 
               dte->BaseDllName.Buffer, sym, *wargv, wcs->Buffer);
             *wargv = wcs->Buffer;

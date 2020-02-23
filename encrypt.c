@@ -57,11 +57,11 @@ static void chaskey(void *mk, void *p) {
 }
 
 // encrypt/decrypt data in counter mode
-void donut_encrypt(void *mk, void *ctr, void *data, size_t len) {
+void donut_encrypt(void *mk, void *ctr, void *data, uint32_t len) {
     uint8_t  x[CIPHER_BLK_LEN], 
              *p=(uint8_t*)data,
              *c=(uint8_t*)ctr;
-    int      i, r;
+    uint32_t      i, r;
     
     while(len) {
       // copy counter+nonce to local buffer
@@ -81,7 +81,7 @@ void donut_encrypt(void *mk, void *ctr, void *data, size_t len) {
       len -= r; p += r;
       
       // update counter
-      for(i=CIPHER_BLK_LEN;i>0;i--)
+      for(i=CIPHER_BLK_LEN;(int)i>0;i--)
         if(++c[i-1]) break;
     }
 }
@@ -178,7 +178,7 @@ int crypto_test(void) {
 
 int main(void) {
     uint8_t tmp1[16];
-    int     i, equ;
+    int     equ;
 
     // Chaskey test
     memcpy(tmp1, plain_tv, 16);

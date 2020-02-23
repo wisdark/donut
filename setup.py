@@ -7,8 +7,8 @@ static_libraries   = ['aplib64']
 static_lib_dir     = 'lib'
 libraries          = []
 library_dirs       = ['lib']
-extra_compile_args = ['--disable-shared', '--enable-static']
-extra_link_args    = ['-Llib', '-l:aplib64']
+extra_compile_args = []
+extra_link_args    = []
 extra_objects      = []
 include_dirs       = ['include']
 sources            = ['donut.c', 
@@ -18,12 +18,16 @@ sources            = ['donut.c',
                       'loader/clib.c', 
                       'donutmodule.c']
 
-if sys.platform == 'win64':
+if sys.platform == 'win32':
     libraries.extend(static_libraries)
     library_dirs.append(static_lib_dir)
     extra_objects = []
+elif sys.platform == 'win64':
+    libraries.extend(static_libraries)
+    library_dirs.append(static_lib_dir)
+    extra_objects = []    
 else: # POSIX
-    extra_objects = ['{}/lib{}.a'.format(static_lib_dir, l) for l in static_libraries]
+    extra_objects = ['{}/{}.a'.format(static_lib_dir, l) for l in static_libraries]
 
 
 module = Extension(

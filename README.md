@@ -1,266 +1,314 @@
-# Using Donut
+[![Issues](https://img.shields.io/github/issues/thewover/donut)](https://github.com/TheWover/donut/issues)
+[![Contributors](https://img.shields.io/github/contributors/thewover/donut)](https://github.com/TheWover/donut/graphs/contributors)
+[![Stars](https://img.shields.io/github/stars/thewover/donut)](https://github.com/TheWover/donut/stargazers)
+[![Forks](https://img.shields.io/github/forks/thewover/donut)](https://github.com/TheWover/donut/network/members)
+[![License](https://img.shields.io/github/license/thewover/donut)](https://github.com/TheWover/donut/blob/master/LICENSE)
+[![Chat](https://img.shields.io/badge/chat-%23donut-orange)](https://bloodhoundgang.herokuapp.com/)
+[![Github All Releases](https://img.shields.io/github/downloads/thewover/donut/total.svg)](http://www.somsubhra.com/github-release-stats/?username=thewover&repository=donut) 
+[![Twitter URL](https://img.shields.io/twitter/url/http/shields.io.svg?style=social)](https://twitter.com/intent/tweet?original_referer=https://github.com/TheWover/donut&text=%23Donut+An+open-source+shellcode+generator+that+supports+in%2Dmemory+execution+of+VBS%2FJS%2FEXE%2FDLL+files:+https://github.com/TheWover/donut)
 
-![Alt text](https://github.com/TheWover/donut/blob/master/img/donut.PNG?raw=true "An ASCII donut")                                                                                                               
+![Alt text](https://github.com/TheWover/donut/blob/master/img/donut_logo_white.jpg?raw=true "Donut Logo")
 
-Version: 0.9.2 *please submit issues and requests for v1.0 release*
+<p>Current version: <a href="https://thewover.github.io/TBD/">v0.9.3</a> <em>please submit issues and requests for v1.0 release</em></p>
 
-Odzhan's blog post (about the generator): https://modexp.wordpress.com/2019/05/10/dotnet-loader-shellcode/
+<h2>Table of contents</h2>
 
-TheWover's blog post (detailed walkthrough, and about how donut affects tradecraft): https://thewover.github.io/Introducing-Donut/
+<ol>
+  <li><a href="#intro">Introduction</a></li>
+  <li><a href="#how">How It Works</a></li>
+  <li><a href="#build">Building</a></li>
+  <li><a href="#usage">Usage</a></li>
+  <li><a href="#subproj">Subprojects</a></li>
+  <li><a href="#dev">Developing with Donut</a></li>
+  <li><a href="#qad">Questions and Discussions</a></li>
+  <li><a href="#disclaimer">Disclaimer</a></li>
+</ol>
 
-v0.9.2 release blog post: https://thewover.github.io/Bear-Claw/
+<h2 id="intro">1. Introduction</h2>
 
-## Introduction
+<p><strong>Donut</strong> is a position-independent code that enables in-memory execution of VBScript, JScript, EXE, DLL files and dotNET assemblies. A module created by Donut can either be staged from a HTTP server or embedded directly in the loader itself. The module is optionally encrypted using the <a href="https://tinycrypt.wordpress.com/2017/02/20/asmcodes-chaskey-cipher/">Chaskey</a> block cipher and a 128-bit randomly generated key. After the file is loaded and executed in memory, the original reference is erased to deter memory scanners. The generator and loader support the following features:</p>
 
-Donut generates x86 or x64 shellcode from VBScript, JScript, EXE, DLL (including .NET Assemblies) files. This shellcode can be injected into an arbitrary Windows process for in-memory execution. Given a supported file type, parameters and an entry point where applicable (such as Program.Main), it produces position-independent shellcode that loads and runs entirely from memory. A module created by donut can either be staged from a URL or stageless by being embedded directly in the shellcode. Either way, the module is encrypted with the Chaskey block cipher and a 128-bit randomly generated key. After the file is loaded through the PE/ActiveScript/CLR loader, the original reference is erased from memory to deter memory scanners. For .NET Assemblies, they are loaded into a new Application Domain to allow for running Assemblies in disposable AppDomains.
+<ul>
+  <li>Compression of input files with aPLib and LZNT1, Xpress, Xpress Huffman via RtlCompressBuffer.</li> 
+  <li>Using entropy for API hashes and generation of strings.</li> 
+  <li>128-bit symmetric encryption of files.</li>
+  <li>Patching Antimalware Scan Interface (AMSI) and Windows Lockdown Policy (WLDP).</li>
+  <li>Patching command line for EXE files.</li>
+  <li>Patching exit-related API to avoid termination of host process.</li>
+  <li>Multiple output formats: C, Ruby, Python, PowerShell, Base64, C#, Hexadecimal.</li>
+</ul>
 
-It can be used in several ways.
+<p>There are dynamic and static libraries for both Linux and Windows that can be integrated into your own projects. There's also a python module which you can read more about in <a href="https://github.com/TheWover/donut/blob/master/docs/2019-08-21-Python_Extension.md">Building and using the Python extension.</a></p>
 
-## As a Standalone Tool
+<h2 id="how">2. How It Works</h2>
 
-Donut can be used as-is to generate shellcode from VBS/JS/EXE/DLL files or .NET Assemblies. A Linux and Windows executable and a Python module are provided for loader generation. The Python documentation can be found [here](https://github.com/TheWover/donut/blob/master/docs/2019-08-21-Python_Extension.md). The command-line syntax is as described below.
+<p>Donut contains individual loaders for each supported file type. For dotNET EXE/DLL assemblies, Donut uses the Unmanaged CLR Hosting API to load the Common Language Runtime. Once the CLR is loaded into the host process, a new Application Domain is created to allow for running Assemblies in disposable AppDomains. When the AppDomain is ready, the dotNET Assembly is loaded via the AppDomain.Load_3 method. Finally, the Entry Point for EXEs or public method for DLLs specified by the user is invoked with any additional parameters. Refer to MSDN for documentation on the <a href=" https://docs.microsoft.com/en-us/dotnet/framework/unmanaged-api/hosting/clr-hosting-interfaces">Unmanaged CLR Hosting API.</a> For a standalone example of a CLR Host, refer to <a href="https://github.com/TheWover/donut/blob/master/DonutTest/rundotnet.cpp">code here.</a></p>
 
-```
- usage: donut [options] <EXE/DLL/VBS/JS>
- 
-       Only the finest artisanal donuts are made of shells.
+<p>VBScript and JScript files are executed using the IActiveScript interface. There's also minimal support for some of the methods provided by the Windows Script Host (wscript/cscript). For a standalone example, refer to <a href="https://gist.github.com/odzhan/d18145b9538a3653be2f9a580b53b063">code here.</a> For a more detailed description, read: <a href="https://modexp.wordpress.com/2019/07/21/inmem-exec-script/">In-Memory Execution of JavaScript, VBScript, JScript and XSL</a></p>
 
-                   -MODULE OPTIONS-
+<p>Unmanaged or native EXE/DLL files are executed using a custom PE loader with support for Delayed Imports, TLS and patching the command line. Only files with relocation information are supported. Read <a href="https://modexp.wordpress.com/2019/06/24/inmem-exec-dll/">In-Memory Execution of DLL</a> for more information.</p>
 
-       -n <name>            Module name. Randomly generated by default with entropy enabled.
-       -s <server>          HTTP server that will host the donut module.
-       -e <level>           Entropy. 1=none, 2=use random names, 3=random names + symmetric encryption (default)
+<p>The loader can disable AMSI and WLDP to help evade detection of malicious files executed in-memory. For more information, read <a href="https://modexp.wordpress.com/2019/06/03/disable-amsi-wldp-dotnet/">How Red Teams Bypass AMSI and WLDP for .NET Dynamic Code</a>. It also supports decompression of files in memory using aPLib or the RtlDecompressBuffer API. Read <a href="https://modexp.wordpress.com/2019/12/08/shellcode-compression/">Data Compression</a> for more information.</p>
 
-                   -PIC/SHELLCODE OPTIONS-
+<p>For a detailed walkthrough using the generator and how Donut affects tradecraft, read <a href="https://thewover.github.io/Introducing-Donut/">Donut - Injecting .NET Assemblies as Shellcode</a>. For more information about the loader, read <a href="https://modexp.wordpress.com/2019/05/10/dotnet-loader-shellcode/">Loading .NET Assemblies From Memory</a>.</p>
 
-       -a <arch>            Target architecture : 1=x86, 2=amd64, 3=x86+amd64(default).
-       -b <level>           Bypass AMSI/WLDP : 1=none, 2=abort on fail, 3=continue on fail.(default)
-       -o <path>            Output file to save loader. Default is "loader.bin"
-       -f <format>          Output format. 1=binary (default), 2=base64, 3=c, 4=ruby, 5=python, 6=powershell, 7=C#, 8=hex
-       -y <oep>             Create a new thread for loader. Optionally execute original entrypoint of host process.
-       -x <action>          Exiting. 1=exit thread (default), 2=exit process
+<p>Those who wish to know more about the internals should refer to <a href="https://github.com/TheWover/donut/blob/master/docs/devnotes.md">Developer notes.</a></p>
 
-                   -FILE OPTIONS-
+<h2 id="build">3. Building</h2>
 
-       -c <namespace.class> Optional class name. (required for .NET DLL)
-       -d <name>            AppDomain name to create for .NET. Randomly generated by default with entropy enabled.
-       -m <method | api>    Optional method or function for DLL. (a method is required for .NET DLL)
-       -p <parameters>      Optional parameters/command line inside quotations for DLL method/function or EXE.
-       -w                   Command line is passed to unmanaged DLL function in UNICODE format. (default is ANSI)
-       -r <version>         CLR runtime version. MetaHeader used by default or v4.0.30319 if none available.
-       -t                   Create new thread for entrypoint of unmanaged EXE.
-       -z <engine>          Pack/Compress file. 1=none, 2=aPLib, 3=LZNT1, 4=Xpress, 5=Xpress Huffman
+<p>There are two types of build. If you want to debug Donut, please refer to <a href="https://github.com/TheWover/donut/blob/master/docs/devnotes.md">documentation here</a>. If not, continue reading for the release build.</p>
 
- examples:
+<h3><strong>Clone</strong></h3>
 
-    donut c2.dll
-    donut -a1 -cTestClass -mRunProcess -pnotepad.exe loader.dll
-    donut loader.dll -c TestClass -m RunProcess -p"calc notepad" -s http://remote_server.com/modules/
-```
+<p>From a Windows command prompt or Linux terminal, clone the repository.</p>
 
-### Building Donut
+<pre> 
+  git clone http://github.com/thewover/donut.git
+</pre>
 
-Tags have been provided for each release version of donut that contain the compiled executables. 
+<p>The next step depends on your operating system and what compiler you decide to use. Currently, the generator and loader template for Donut can be compiled successfully with both Microsoft Visual Studio 2019 and MingGW-64.  To use the libraries in your own C/C++ project, please refer to the <a href="https://github.com/TheWover/donut/tree/master/examples">examples provided here.</a></p>
 
-* v0.9.2, Bear Claw: https://github.com/TheWover/donut/releases/tag/v0.9.2
-* v0.9.2 Beta: https://github.com/TheWover/donut/releases/tag/v0.9.2
-* v0.9.1, Apple Fritter: https://github.com/TheWover/donut/releases/tag/v0.9.1
-* v0.9, Initial Release: https://github.com/TheWover/donut/releases/tag/v0.9
+<h4><strong>Windows</strong></h4>
 
-However, you may also clone and build the source yourself using the provided makefiles. 
+<p>To generate the loader template, dynamic library donut.dll, the static library donut.lib and the generator donut.exe. Start an x64 Microsoft Visual Studio Developer Command Prompt, change to the directory where you cloned the Donut repository and enter the following:</p>
 
-## Building From Repository
+<pre>
+  nmake -f Makefile.msvc
+</pre>
 
-From a Windows command prompt or Linux terminal, clone the repository and change to the donut directory.
+<p>To do the same, except using MinGW-64 on Windows or Linux, change to the directory where you cloned the Donut repository and enter the following:</p>
 
-```
-git clone http://github.com/thewover/donut
-cd donut
-```
-
-## Linux
-
-Simply run make to generate an executable, static and dynamic libraries.
-
-```
-make
-make clean
-make debug
-```
-
-## Windows
-
-Start a Microsoft Visual Studio Developer Command Prompt and `` cd `` to donut's directory. The Microsft (non-gcc) Makefile can be specified with ``` -f Makefile.msvc ```. The makefile provides the following commmands to build donut:
-
-```
-nmake -f Makefile.msvc
-nmake clean -f Makefile.msvc
-nmake debug -f Makefile.msvc
-```
-
-## As a Library
-
-donut can be compiled as both dynamic and static libraries for both Linux (*.a* / *.so*) and Windows(*.lib* / *.dll*). It has a simple API that is described in *docs/api.html*. Two exported functions are provided: ``` int DonutCreate(PDONUT_CONFIG c) ``` and ``` int DonutDelete(PDONUT_CONFIG c) ``` .
-
-## As a Python Module
-
-Donut can be installed and used as a Python module. To install Donut from your current directory, use pip for Python3.
-
-```
-pip install .
-```
-
-Otherwise, you may install Donut as a Python module by grabbing it from the PyPi repostiory.
-
-```
-pip install donut-shellcode
-```
-
-## As a Template - Rebuilding the shellcode
-
-*loader/* contains the in-memory execution code for EXE/DLL/VBS/JS and .NET assemblies, which should successfully compile with both Microsoft Visual Studio and MinGW-w64. Make files have been provided for both compilers. Whenever files in the loader directory have been changed, recompiling for all architectures is recommended before rebuilding donut.
-
-### Microsoft Visual Studio
-
-**Due to recent changes in the MSVC compiler, we now only support MSVC versions 2019 and later.**
-
-Open the x64 Microsoft Visual Studio build environment, switch to the *loader* directory, and type the following:
-
-```
-nmake clean -f Makefile.msvc
-nmake -f Makefile.msvc
-```
-
-This should generate a 64-bit executable (*loader.exe*) from *loader.c*. exe2h will then extract the shellcode from the *.text* segment of the PE file and save it as a C array to *loader_exe_x64.h*. When donut is rebuilt, this new shellcode will be used for all loaders that it generates.
-
-To generate 32-bit shellcode, open the x86 Microsoft Visual Studio build environment, switch to the loader directory, and type the following:
-
-```
-nmake clean -f Makefile.msvc
-nmake x86 -f Makefile.msvc
-```
-
-This will save the shellcode as a C array to *loader_exe_x86.h*.
-
-### MinGW-W64
-
-If you're on Linux and *MinGW-W64* has been installed from packages or source, you can rebuild the shellcode using *Makefile.mingw*. Change to the *loader* directory and type the following for the AMD64 shellcode:
-
-```
-make -f Makefile.mingw
-```
-
-For the x86 shellcode, simply use the x86 label.
-
-```
-make -f Makefile.mingw x86
-```
-
-Once you've recompiled for all architectures, you may rebuild donut.
-
-## Bypasses
-
-Donut includes a bypass system for AMSI and other security features. Currently we bypass:
-
-* AMSI in .NET v4.8
-* Device Guard policy preventing dynamicly generated code from executing
-
-You may customize our bypasses or add your own. The bypass logic is defined in loader/bypass.c.
-
-Each bypass implements the DisableAMSI fuction with the signature ```BOOL DisableAMSI(PDONUT_INSTANCE inst)```, and comes with a corresponding preprocessor directive. We have several ```#if defined``` blocks that check for definitions. Each block implements the same bypass function. For instance, our first bypass is called ```BYPASS_AMSI_A```. If donut is built with that variable defined, then that bypass will be used.
-
-Why do it this way? Because it means that only the bypass you are using is built into loader.exe. As a result, the others are not included in your shellcode. This reduces the size and complexity of your shellcode, adds modularity to the design, and ensures that scanners cannot find suspicious blocks in your shellcode that you are not actually using.
-
-Another benefit of this design is that you may write your own AMSI bypass. To build Donut with your new bypass, use an ```if defined``` block for your bypass and modify the makefile to add an option that builds with the name of your bypass defined.
-
-If you wanted to, you could extend our bypass system to add in other pre-execution logic that runs before your .NET Assembly is loaded. 
-
-Odzhan wrote a [blog post](https://modexp.wordpress.com/2019/06/03/disable-amsi-wldp-dotnet/) on the details of our AMSI bypass research.
-
-### Additional features.
-
-These are left as exercises to the reader. I would personally recommend:
-
-* Add environmental keying
-* Make donut polymorphic by obfuscating *loader* every time shellcode is generated
-* Integrate donut as a module into your favorite RAT/C2 Framework
-
-## Disclaimers
-
-* No, we will not update donut to counter signatures or detections by any AV.
-* We are not responsible for any misuse of this software or technique. Donut is provided as a demonstration of CLR Injection through shellcode in order to provide red teamers a way to emulate adversaries and defenders a frame of reference for building analytics and mitigations. This inevitably runs the risk of malware authors and threat actors misusing it. However, we believe that the net benefit outweighs the risk. Hopefully that is correct.
-
-# How it works
-
-## Procedure for Assemblies
-
-Donut uses the Unmanaged CLR Hosting API to load the Common Language Runtime. If necessary, the Assembly is downloaded into memory. Either way, it is decrypted using the Chaskey block cipher. Once the CLR is loaded into the host process, a new AppDomain will be created using a random name unless otherwise specified. Once the AppDomain is ready, the .NET Assembly is loaded through AppDomain.Load_3. Finally, the Entry Point specified by the user is invoked with any specified parameters.
-
-The logic above describes how the shellcode generated by donut works. That logic is defined in *loader.exe*. To get the shellcode, *exe2h* extracts the compiled machine code from the *.text* segment in *loader.exe* and saves it as a C array to a C header file. *donut* combines the shellcode with a Donut Instance (a configuration for the shellcode) and a Donut Module (a structure containing the .NET assembly, class name, method name and any parameters).
-
-Refer to MSDN for documentation on the Undocumented CLR Hosting API: https://docs.microsoft.com/en-us/dotnet/framework/unmanaged-api/hosting/clr-hosting-interfaces
-
-For a standalone example of a CLR Host, refer to Casey Smith's AssemblyLoader repo: https://github.com/caseysmithrc/AssemblyLoader
-
-Detailed blog posts about how donut works are available at both Odzhan's and TheWover's blogs. Links are at the top of the README.
-
-## Procedure for ActiveScript
-
-The details of how Donut loads scripts from memory have been detailed by Odzhan in a [blog post](https://modexp.wordpress.com/2019/07/21/inmem-exec-script/).
-
-## Procedure for PE Loading
-
-The details of how Donut loads PE files from memory have been detailed by Odzhan in a [blog post](https://modexp.wordpress.com/2019/06/24/inmem-exec-dll/).
-
-Only PE files with relocation information (.reloc) are supported. TLS callbacks are only executed for the initial execution of entrypoint.
-
-## Components
-
-Donut contains the following elements:
-
-* donut.c: The source code for the donut loader generator.
-* donut.exe: The compiled loader generator as an EXE.
-* donut.py: The donut loader generator as a Python script *(planned for version 1.0)*
-* donutmodule.c: The CPython wrapper for Donut. Used by the Python module.
-* setup.py: The setup file for installing Donut as a Pip Python3 module.
-* lib/donut.dll, lib/donut.lib: Donut as a dynamic and static library for use in other projects on Windows platform.
-* lib/donut.so, lib/donut.a: Donut as a dynamic and static library for use in other projects on the Linux platform.
-* lib/donut.h: Header file to include if using the static or dynamic libraries in a C/C++ project.
-* loader/loader.c: Main file for the shellcode.
-* loader/inmem_dotnet.c: In-Memory loader for .NET EXE/DLL assemblies.
-* loader/inmem_pe.c: In-Memory loader for EXE/DLL files.
-* loader/inmem_script.c: In-Memory loader for VBScript/JScript files.
-* loader/activescript.c: ActiveScriptSite interface required for in-memory execution of VBS/JS files.
-* loader/wscript.c: Supports a number of WScript methods that cscript/wscript support.
-* loader/bypass.c: Functions to bypass Anti-malware Scan Interface (AMSI) and Windows Local Device Policy (WLDP).
-* loader/http_client.c: Downloads a module from remote staging server into memory.
-* loader/peb.c: Used to resolve the address of DLL functions via Process Environment Block (PEB).
-* loader/clib.c: Replaces common C library functions like memcmp, memcpy and memset.
-* loader/inject.exe: The compiled C shellcode injector.
-* loader/inject.c: A C shellcode injector that injects loader.bin into a specified process for testing.
-* loader/runsc.c: A C shellcode runner for testing loader.bin in the simplest manner possible.
-* loader/runsc.exe: The compiled C shellcode runner.
-* loader/exe2h/exe2h.c: Source code for exe2h.
-* loader/exe2h/exe2h.exe: Extracts the useful machine code from loader.exe and saves as array to C header file.
-* encrypt.c: Chaskey 128-bit block cipher in Counter (CTR) mode used for encryption.
-* hash.c: Maru hash function. Uses the Speck 64-bit block cipher with Davies-Meyer construction for API hashing.
-
-# Subprojects
-
-There are three companion projects provided with donut:
-
-* DemoCreateProcess: A sample .NET Assembly to use in testing. Takes two command-line parameters that each specify a program to execute.
-* DonutTest: A simple C# shellcode injector to use in testing donut. The shellcode must be base64 encoded and copied in as a string. 
-* ModuleMonitor: A proof-of-concept tool that detects CLR injection as it is done by tools such as donut and Cobalt Strike's execute-assembly.
-* ProcessManager: A Process Discovery tool that offensive operators may use to determine what to inject into and defensive operators may use to determine what is running, what properties those processes have, and whether or not they have the CLR loaded. 
-
-# Project plan
-
-* ~~Create a donut Python C extension that allows users to write Python programs that can use the donut API programmatically. It would be written in C, but exposed as a Python module.~~
-* ~~Create a C# version of the generator.~~
-* Create a donut.py generator that uses the same command-line parameters as donut.exe.
-* Add support for HTTP proxies.
-* ~~Find ways to simplify the shellcode if possible.~~
-* Write a blog post on how to integrate donut into your tooling, debug it, customize it, and design loaders that work with it.
-* ~~Dynamic Calls to DLL functions.~~
-* ~~Handle the ProcessExit event from AppDomain using unmanaged code.~~
+<pre>
+  make -f Makefile.mingw
+</pre>
+
+<h4><strong>Linux</strong></h4>
+
+<p>To generate the dynamic library donut.so, the static library donut.a and the generator donut. Change to the directory where you cloned the Donut repository and simply type make.</p>
+
+<h3>Python Module</h3>
+
+<p>Donut can be installed and used as a Python module. To install from source requires pip for Python3. First, ensure older versions of donut-shellcode are not installed by issuing the following command on Linux terminal or Microsoft Visual Studio command prompt.</p>
+
+<pre>
+  pip3 uninstall donut-shellcode
+</pre>
+
+<p>After you confirm older versions are no longer installed, issue the following command.</p>
+
+<pre>
+  pip3 install .
+</pre>
+
+<p>You may also install Donut as a Python module by grabbing it from the PyPi repository.</p>
+
+<pre>
+  pip3 install donut-shellcode
+</pre>
+
+<p>For more information, please refer to <a href="https://github.com/TheWover/donut/blob/master/docs/2019-08-21-Python_Extension.md">Building and using the Python extension.</a></p>
+
+<h3>Releases</h3>
+
+<p>Tags have been provided for each release version of Donut that contain the compiled executables.</p>
+
+<ul>
+  <li><a href="https://github.com/TheWover/donut/releases/tag/v0.9.3">v0.9.3, TBD</a></li>
+  <li><a href="https://github.com/TheWover/donut/releases/tag/v0.9.2">v0.9.2, Bear Claw</a></li>
+  <li><a href="https://github.com/TheWover/donut/releases/tag/v0.9.1">v0.9.1, Apple Fritter</a></li>
+  <li><a href="https://github.com/TheWover/donut/releases/tag/v0.9">v0.9.0, Initial Release</a></li>
+</ul>
+
+<p>Currently, there are two other generators available.</p>
+
+<ul>
+  <li><a href="https://github.com/n1xbyte/donutCS">C# generator by n1xbyte</a></li>
+  <li><a href="https://github.com/Binject/go-donut">Go generator by awgh</a></li>
+</ul>
+
+<h2 id="usage">4. Usage</h2>
+
+<p>The following table lists switches supported by the command line version of the generator.</p>
+
+<table border="1">
+  <tr>
+    <th>Switch</th>
+    <th>Argument</th>
+    <th>Description</th>
+  </tr>
+  
+  <tr>
+    <td><strong>-a</strong></td>
+    <td><var>arch</var></td>
+    <td>Target architecture for loader : 1=x86, 2=amd64, 3=x86+amd64(default).</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-b</strong></td>
+    <td><var>level</var></td>
+    <td>Behavior for bypassing AMSI/WLDP : 1=None, 2=Abort on fail, 3=Continue on fail.(default)</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-c</strong></td>
+    <td><var>class</var></td>
+    <td>Optional class name. (required for .NET DLL) Can also include namespace: e.g <em>namespace.class</em></td>
+  </tr>  
+  
+  <tr>
+    <td><strong>-d</strong></td>
+    <td><var>name</var></td>
+    <td>AppDomain name to create for .NET. If entropy is enabled, one will be generated randomly.</td>
+  </tr>  
+
+  <tr>
+    <td><strong>-e</strong></td>
+    <td><var>level</var></td>
+    <td>Entropy level. 1=None, 2=Generate random names, 3=Generate random names + use symmetric encryption (default)</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-f</strong></td>
+    <td><var>format</var></td>
+    <td>The output format of loader saved to file. 1=Binary (default), 2=Base64, 3=C, 4=Ruby, 5=Python, 6=PowerShell, 7=C#, 8=Hexadecimal</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-m</strong></td>
+    <td><var>name</var></td>
+    <td>Optional method or function for DLL. (a method is required for .NET DLL)</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-n</strong></td>
+    <td><var>name</var></td>
+    <td>Module name for HTTP staging. If entropy is enabled, one is generated randomly.</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-o</strong></td>
+    <td><var>path</var></td>
+    <td>Specifies where Donut should save the loader. Default is "loader.bin" in the current directory.</td>
+  </tr>
+
+  <tr>
+    <td><strong>-p</strong></td>
+    <td><var>parameters</var></td>
+    <td>Optional parameters/command line inside quotations for DLL method/function or EXE.</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-r</strong></td>
+    <td><var>version</var></td>
+    <td>CLR runtime version. MetaHeader used by default or v4.0.30319 if none available.</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-s</strong></td>
+    <td><var>server</var></td>
+    <td>URL for the HTTP server that will host a Donut module.</td>
+  </tr>
+
+  <tr>
+    <td><strong>-t</strong></td>
+    <td></td>
+    <td>Run the entrypoint of an unmanaged/native EXE as a thread and wait for thread to end.</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-w</strong></td>
+    <td></td>
+    <td>Command line is passed to unmanaged DLL function in UNICODE format. (default is ANSI)</td>
+  </tr>
+  
+  <tr>
+    <td><strong>-x</strong></td>
+    <td><var>option</var></td>
+    <td>Determines how the loader should exit. 1=exit thread (default), 2=exit process.</td>
+  </tr>
+
+  <tr>
+    <td><strong>-y</strong></td>
+    <td><var>addr</var></td>
+    <td>Creates a new thread for the loader and continues execution at the address of host process.</td>
+  </tr>
+
+  <tr>
+    <td><strong>-z</strong></td>
+    <td><var>engine</var></td>
+    <td>Pack/Compress the input file. 1=None, 2=aPLib, 3=LZNT1, 4=Xpress, 5=Xpress Huffman. Currently, the last three are only supported on Windows.</td>
+  </tr>
+</table>
+
+<h3 id="requirements">Payload Requirements</h2>
+
+<p>There are some specific requirements that your payload must meet in order for Donut to successfully load it.</p>
+
+<h3 id="requirements-dotnet">.NET Assemblies</h2>
+
+<ul>
+  <li>The entry point method must only take strings as arguments, or take no arguments.</li>
+  <li>The entry point method must be marked as public and static.</li>
+  <li>The class containing the entry point method must be marked as public.</li>
+  <li>The Assembly must NOT be a Mixed Assembly (contain both managed and native code).</li>
+  <li>As such, the Assembly must NOT contain any Unmanaged Exports.</li>
+</ul>
+
+<h3 id="requirements-native">Native EXE/DLL</h2>
+
+<ul>
+  <li>Binaries built with Cygwin are unsupported.</li>
+</ul>
+
+<p>Cygwin executables use initialization routines that expect the host process to be running from disk. If executing from memory, the host process will likely crash.</p>
+
+<h3 id="requirements-dotnet">Unmanaged DLLs</h2>
+
+<ul>
+  <li>A user-specified entry point method must only take a string as an argument, or take no arguments. We have provided an <a href="https://github.com/TheWover/donut/blob/master/DonutTest/dlltest.c/">example</a>.</li>
+</ul>
+
+<h2 id="subproj">5. Subprojects</h2>
+
+<p>There are four companion projects provided with donut:</p>
+
+<table border="1">
+  <tr>
+    <th>Tool</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>DemoCreateProcess</td>
+    <td>A sample .NET Assembly to use in testing. Takes two command-line parameters that each specify a program to execute.</td>
+  </tr>
+  <tr>
+    <td>DonutTest</td>
+    <td>A simple C# shellcode injector to use in testing donut. The shellcode must be base64 encoded and copied in as a string.</td>
+  </tr>
+  <tr>
+    <td>ModuleMonitor</td>
+    <td>A proof-of-concept tool that detects CLR injection as it is done by tools such as Donut and Cobalt Strike's execute-assembly.</td>
+  </tr>
+  <tr>
+    <td>ProcessManager</td>
+    <td>A Process Discovery tool that offensive operators may use to determine what to inject into and defensive operators may use to determine what is running, what properties those processes have, and whether or not they have the CLR loaded. </td>
+  </tr>
+</table>
+
+<h2 id="dev">6. Developing with Donut</h2>
+
+<p>You may want to add support for more types of payloads, change our feature set, or integrate Donut into your existing tooling. We have provided <a href="https://github.com/TheWover/donut/blob/master/docs/devnotes.md">developer documentation</a>. Additional features are left as exercises to the reader. Our suggestions:</p>
+
+<ul>
+  <li>Add environmental keying.</li>
+  <li>Make Donut polymorphic by obfuscating the loader every time shellcode is generated.</li>
+  <li>Integrate Donut as a module into your favorite RAT/C2 Framework.</li>
+</ul>
+
+<h2 id="qad">7. Questions and Discussion</h2>
+
+<p>If you have any questions or comments about Donut. Join the #Donut channel in the <a href="https://bloodhoundgang.herokuapp.com/">BloodHound Gang Slack</a></p>
+
+<h2 id="disclaimer">8. Disclaimer</h2>
+
+<p>We are not responsible for any misuse of this software or technique. Donut is provided as a demonstration of CLR Injection and in-memory loading through shellcode in order to provide red teamers a way to emulate adversaries and defenders a frame of reference for building analytics and mitigations. This inevitably runs the risk of malware authors and threat actors misusing it. However, we believe that the net benefit outweighs the risk. Hopefully that is correct. In the event EDR or AV products are capable of detecting Donut via signatures or behavioral patterns, we will not update Donut to counter signatures or detection methods. To avoid being offended, please do not ask.</p>
